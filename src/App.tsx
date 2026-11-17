@@ -1,0 +1,618 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
+import {
+  AdministrationView,
+  AuditLogsView,
+  DeploymentSecurityView,
+} from './components/AdminAndAuditViews';
+import { ChangePasswordModal } from './components/ChangePasswordModal';
+import { LeaveCalendar } from './components/LeaveCalendar';
+import { LeaveRequestModal } from './components/LeaveRequestModal';
+import { LoginScreen } from './components/LoginScreen';
+import {
+  ManagementQueueView,
+  ReportsView,
+  StaffDirectoryView,
+} from './components/ManagementViews';
+import { MyRequestsView } from './components/MyRequestsView';
+import { PortalShell } from './components/PortalShell';
+import { StaffDashboard } from './components/StaffDashboard';
+import { auth } from './firebase/client';
+import {
+  DEFAULT_APP_SETTINGS,
+  approveLeaveRequest,
+  cancelPendingLeaveRequest,
+  changeOwnPassword,
+  logoutSession,
+  processLeaveModification,
+  rejectLeaveRequest,
+  removeStaffAccount,
+  requestLeaveModification,
+  resolveSignedInStaffProfile,
+  submitLeaveRequest,
+  subscribeAllRequests,
+  subscribeAllStaff,
+  subscribeAuditLogs,
+  subscribeMonthCapacity,
+  subscribeMonthCapacityDetails,
+  subscribeMyRequests,
+  subscribeSettings,
+  subscribeStaffProfile,
+  updatePortalSettings,
+  updateStaffProfile,
+} from './services/firebasePortalService';
+import {
+  AppSettings,
+  AuditLog,
+  DailyCapacity,
+  DailyCapacityDetail,
+  Designation,
+  LeaveRequest,
+  LeaveType,
+  PortalView,
+  StaffProfile,
+  ToastMessage,
+  UserRole,
+} from './types/portal';
+import { buildPendingDemandMap } from './utils/leaveRules';
+import { getTodayInMaldives } from './utils/maldivesDate';
+
+export default function App() {
+  const todayMaldives = getTodayInMaldives();
+  const initialYear = Number(todayMaldives.slice(0, 4));
+  const initialMonth0 = Number(todayMaldives.slice(5, 7)) - 1;
+
+  // Theme state synced with <html class="dark">
+  const [darkMode, setDarkMode] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = window.localStorage.getItem('ssu_theme');
+      if (saved === 'dark') return true;
+      if (saved === 'light') return false;
+    }
+    return false;
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (darkMode) {
+      root.classList.add('dark');
+      window.localStorage.setItem('ssu_theme', 'dark');
+    } else {
+      root.classList.remove('dark');
+      window.localStorage.setItem('ssu_theme', 'light');
+    }
+  }, [darkMode]);
+
+  // Firebase Auth & Active Staff Profile state
+  const [authReady, setAuthReady] = useState(false);
+  const [liveProfile, setLiveProfile] = useState<StaffProfile | null>(null);
+  const [authErrorBanner, setAuthErrorBanner] = useState<string | null>(null);
+
+  // Real-time Firestore Data
+  const [liveSettings, setLiveSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
+  const [liveMyRequests, setLiveMyRequests] = useState<LeaveRequest[]>([]);
+  const [liveAllRequests, setLiveAllRequests] = useState<LeaveRequest[]>([]);
+  const [liveProfiles, setLiveProfiles] = useState<StaffProfile[]>([]);
+  const [liveCapacityMap, setLiveCapacityMap] = useState<Record<string, DailyCapacity>>({});
+  const [liveCapacityDetailsMap, setLiveCapacityDetailsMap] = useState<
+    Record<string, DailyCapacityDetail>
+  >({});
+  const [liveAuditLogs, setLiveAuditLogs] = useState<AuditLog[]>([]);
+  const [loadingRequests, setLoadingRequests] = useState(false);
+
+  // Navigation & Calendar state
+  const [activeView, setActiveView] = useState<PortalView>('dashboard');
+  const [calendarYear, setCalendarYear] = useState(initialYear);
+  const [calendarMonth0, setCalendarMonth0] = useState(initialMonth0);
+
+  // New Request Modal
+  const [newReqModalOpen, setNewReqModalOpen] = useState(false);
+  const [prefillStart, setPrefillStart] = useState<string | undefined>();
+  const [prefillEnd, setPrefillEnd] = useState<string | undefined>();
+
+  // Password Change Modal
+  const [changePwdModalOpen, setChangePwdModalOpen] = useState(false);
+
+  // Toasts
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const addToast = useCallback(
+    (type: ToastMessage['type'], title: string, detail?: string) => {
+      const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      setToasts((prev) => [...prev, { id, type, title, detail }]);
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, 5500);
+    },
+    []
+  );
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const clearSignedInState = useCallback(() => {
+    setLiveProfile(null);
+    setLiveMyRequests([]);
+    setLiveAllRequests([]);
+    setLiveProfiles([]);
+    setLiveCapacityMap({});
+    setLiveCapacityDetailsMap({});
+    setLiveAuditLogs([]);
+    setLoadingRequests(false);
+  }, []);
+
+  // Listen to Firebase Auth state changes
+  useEffect(() => {
+    let active = true;
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (!active) return;
+      if (!firebaseUser) {
+        clearSignedInState();
+        setAuthReady(true);
+        return;
+      }
+
+      try {
+        const profile = await resolveSignedInStaffProfile(firebaseUser.uid);
+        if (!active) return;
+        setAuthErrorBanner(null);
+        setLiveProfile(profile);
+      } catch (err) {
+        if (!active) return;
+        const msg = err instanceof Error ? err.message : 'Unable to verify staff profile.';
+        await logoutSession().catch(() => undefined);
+        clearSignedInState();
+        setAuthErrorBanner(msg);
+      } finally {
+        if (active) setAuthReady(true);
+      }
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [clearSignedInState]);
+
+  const activeStaffId = liveProfile?.staffId || null;
+  const activeRole = liveProfile?.role || null;
+
+  // Real-time Firestore listeners scoped by role
+  useEffect(() => {
+    if (!activeStaffId || !activeRole) return;
+
+    setLoadingRequests(true);
+    const onSubError = (err: Error) => {
+      addToast('error', 'Firestore Sync Error', err.message);
+      setLoadingRequests(false);
+    };
+
+    const unsubscribers = [
+      subscribeStaffProfile(
+        activeStaffId,
+        (updated) => {
+          if (!updated || !updated.isActive) {
+            void logoutSession().catch(() => undefined);
+            clearSignedInState();
+            setAuthErrorBanner('Your staff account is inactive or unavailable.');
+            return;
+          }
+          setLiveProfile(updated);
+        },
+        onSubError
+      ),
+      subscribeSettings(setLiveSettings, onSubError),
+      subscribeMyRequests(
+        activeStaffId,
+        (items) => {
+          setLiveMyRequests(items);
+          setLoadingRequests(false);
+        },
+        onSubError
+      ),
+    ];
+
+    if (activeRole === 'executive' || activeRole === 'manager') {
+      unsubscribers.push(
+        subscribeAllRequests(setLiveAllRequests, onSubError),
+        subscribeAllStaff(setLiveProfiles, onSubError)
+      );
+    } else {
+      setLiveAllRequests([]);
+      setLiveProfiles([]);
+    }
+
+    if (activeRole === 'manager') {
+      unsubscribers.push(subscribeAuditLogs(setLiveAuditLogs, onSubError));
+    } else {
+      setLiveAuditLogs([]);
+    }
+
+    return () => {
+      for (const unsub of unsubscribers) {
+        unsub();
+      }
+    };
+  }, [activeStaffId, activeRole, addToast, clearSignedInState]);
+
+  // Real-time listeners for active calendar month capacity
+  useEffect(() => {
+    if (!activeStaffId) return;
+
+    const onMonthError = (err: Error) => {
+      addToast('error', 'Calendar Sync Error', err.message);
+    };
+
+    const unsubCap = subscribeMonthCapacity(
+      calendarYear,
+      calendarMonth0,
+      setLiveCapacityMap,
+      onMonthError
+    );
+    const unsubDetails = subscribeMonthCapacityDetails(
+      calendarYear,
+      calendarMonth0,
+      setLiveCapacityDetailsMap,
+      onMonthError
+    );
+
+    return () => {
+      unsubCap();
+      unsubDetails();
+    };
+  }, [activeStaffId, calendarYear, calendarMonth0, addToast]);
+
+  const handleLoginSuccess = (user: StaffProfile) => {
+    setAuthErrorBanner(null);
+    setLiveProfile(user);
+    setActiveView('dashboard');
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await logoutSession();
+    } catch {
+      // Ignore network errors on logout and clear local state
+    }
+    clearSignedInState();
+    setActiveView('dashboard');
+  };
+
+  // For regular staff, allRequests represents their own requests (colleagues' approved
+  // spans are merged in StaffDashboard from public non-PII dailyCapacityDetails).
+  const activeAllRequests = useMemo(() => {
+    if (!liveProfile) return [];
+    if (liveProfile.role === 'executive' || liveProfile.role === 'manager') {
+      return liveAllRequests;
+    }
+    return liveMyRequests;
+  }, [liveProfile, liveAllRequests, liveMyRequests]);
+
+  const pendingDemandMap = useMemo(
+    () => buildPendingDemandMap(activeAllRequests),
+    [activeAllRequests]
+  );
+
+  const pendingQueueCount = useMemo(
+    () =>
+      activeAllRequests.filter(
+        (r) =>
+          r.status === 'pending' ||
+          (r.status === 'approved' && r.modificationRequestType !== 'none')
+      ).length,
+    [activeAllRequests]
+  );
+
+  const handleOpenNewRequest = (start?: string, end?: string) => {
+    setPrefillStart(start);
+    setPrefillEnd(end);
+    setNewReqModalOpen(true);
+  };
+
+  // Keep activeView authorized if role changes in real time
+  useEffect(() => {
+    if (!liveProfile) return;
+    if (
+      liveProfile.role === 'staff' &&
+      ['management', 'directory', 'reports', 'admin', 'audit', 'deployment'].includes(
+        activeView
+      )
+    ) {
+      setActiveView('dashboard');
+    } else if (
+      liveProfile.role === 'executive' &&
+      ['admin', 'audit', 'deployment'].includes(activeView)
+    ) {
+      setActiveView('dashboard');
+    }
+  }, [liveProfile, activeView]);
+
+  // Real-time Firestore Action Handlers
+  const handleSubmitLeave = async (payload: {
+    leaveType: LeaveType;
+    startDate: string;
+    endDate: string;
+    dates: string[];
+    reason: string;
+  }) => {
+    if (!liveProfile) return;
+    await submitLeaveRequest(liveProfile, {
+      leaveType: payload.leaveType,
+      startDate: payload.startDate,
+      endDate: payload.endDate,
+      reason: payload.reason,
+    });
+    addToast(
+      'success',
+      'Leave Request Submitted',
+      `${payload.dates.length} day(s) saved to Cloud Firestore.`
+    );
+  };
+
+  const handleCancelPending = async (req: LeaveRequest) => {
+    if (!liveProfile) return;
+    await cancelPendingLeaveRequest(liveProfile, req);
+    addToast('info', 'Pending Request Cancelled');
+  };
+
+  const handleRequestModification = async (params: {
+    req: LeaveRequest;
+    type: 'edit' | 'cancel';
+    note: string;
+    requestedStartDate?: string;
+    requestedEndDate?: string;
+  }) => {
+    if (!liveProfile) return;
+    await requestLeaveModification(liveProfile, params.req, {
+      type: params.type,
+      note: params.note,
+      requestedStartDate: params.requestedStartDate,
+      requestedEndDate: params.requestedEndDate,
+    });
+    addToast('success', 'Modification Request Sent', 'Management will review your request.');
+  };
+
+  const handleApproveLeave = async (requestId: string, comment: string) => {
+    if (!liveProfile) return;
+    await approveLeaveRequest(liveProfile, requestId, comment, liveSettings);
+    addToast('success', 'Leave Approved', 'Daily capacity counters updated atomically.');
+  };
+
+  const handleRejectLeave = async (requestId: string, comment: string) => {
+    if (!liveProfile) return;
+    await rejectLeaveRequest(liveProfile, requestId, comment);
+    addToast('info', 'Leave Request Rejected');
+  };
+
+  const handleProcessModification = async (
+    requestId: string,
+    decision: 'approve_cancel' | 'approve_edit' | 'decline_modification',
+    comment: string
+  ) => {
+    if (!liveProfile) return;
+    await processLeaveModification(
+      liveProfile,
+      requestId,
+      decision,
+      comment,
+      liveSettings
+    );
+    addToast('success', 'Modification Processed', 'Daily slots and audit log updated.');
+  };
+
+  const handleUpdateStaff = async (
+    target: StaffProfile,
+    updates: {
+      fullName: string;
+      designation: Designation;
+      role: UserRole;
+      isActive: boolean;
+      unitSection: string;
+      annualPeriodLimit: number;
+    }
+  ) => {
+    if (!liveProfile) return;
+    await updateStaffProfile(liveProfile, target, updates);
+    addToast('success', 'Staff Updated', `${target.staffId} permissions updated.`);
+  };
+
+  const handleRemoveStaff = async (target: StaffProfile) => {
+    if (!liveProfile) return;
+    const res = await removeStaffAccount(liveProfile, target);
+    addToast(
+      'info',
+      'Staff Account Removed',
+      `${target.fullName} (${target.staffId}) removed (${res.removedRequests} leave record(s) cleaned up).`
+    );
+  };
+
+  const handleChangePassword = async (
+    currentPassword: string,
+    newPassword: string
+  ) => {
+    if (!liveProfile) return;
+    await changeOwnPassword(liveProfile, currentPassword, newPassword);
+    setChangePwdModalOpen(false);
+    addToast(
+      'success',
+      'Password Updated',
+      'Your personal password has been updated in Firebase Authentication.'
+    );
+  };
+
+  const handleUpdateSettings = async (next: {
+    maxDailyCombinedCap: number;
+    maxAnnualLeavePeriods: number;
+  }) => {
+    if (!liveProfile) return;
+    await updatePortalSettings(liveProfile, next);
+    addToast('success', 'Portal Settings Saved');
+  };
+
+  // Loading state during Firebase Auth initialization
+  if (!authReady) {
+    return (
+      <div className="min-h-screen bg-slate-50 dark:bg-[#07111E] flex items-center justify-center p-6">
+        <div className="text-center space-y-2">
+          <div className="w-8 h-8 border-2 border-teal-600 border-t-transparent rounded-full animate-spin mx-auto" />
+          <p className="text-xs font-medium text-slate-600 dark:text-slate-400">
+            Initializing Special Services Leave Management Portal...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Unauthenticated -> Staff ID & Password Login Screen
+  if (!liveProfile) {
+    return (
+      <LoginScreen
+        darkMode={darkMode}
+        onToggleDarkMode={() => setDarkMode((d) => !d)}
+        onLoginSuccess={handleLoginSuccess}
+        authErrorBanner={authErrorBanner}
+      />
+    );
+  }
+
+  const mustForcePasswordChange = Boolean(liveProfile.mustChangePassword);
+
+  return (
+    <PortalShell
+      profile={liveProfile}
+      activeView={activeView}
+      onChangeView={setActiveView}
+      onOpenNewRequest={handleOpenNewRequest}
+      darkMode={darkMode}
+      onToggleDarkMode={() => setDarkMode((d) => !d)}
+      onSignOut={handleSignOut}
+      onOpenChangePassword={() => setChangePwdModalOpen(true)}
+      toasts={toasts}
+      onDismissToast={dismissToast}
+      pendingQueueCount={pendingQueueCount}
+    >
+      {activeView === 'dashboard' && (
+        <StaffDashboard
+          profile={liveProfile}
+          allRequests={activeAllRequests}
+          profiles={liveProfiles}
+          capacityMap={liveCapacityMap}
+          capacityDetailsMap={liveCapacityDetailsMap}
+          settings={liveSettings}
+          calendarYear={calendarYear}
+          calendarMonth0={calendarMonth0}
+          onChangeMonth={(y, m0) => {
+            setCalendarYear(y);
+            setCalendarMonth0(m0);
+          }}
+          onOpenNewRequest={handleOpenNewRequest}
+          loading={loadingRequests}
+        />
+      )}
+
+      {activeView === 'calendar' && (
+        <LeaveCalendar
+          year={calendarYear}
+          monthIndex0={calendarMonth0}
+          onChangeMonth={(y, m0) => {
+            setCalendarYear(y);
+            setCalendarMonth0(m0);
+          }}
+          capacityMap={liveCapacityMap}
+          capacityDetailsMap={liveCapacityDetailsMap}
+          pendingDemandMap={pendingDemandMap}
+          allRequests={activeAllRequests}
+          currentProfile={liveProfile}
+          settings={liveSettings}
+          onRequestRange={handleOpenNewRequest}
+        />
+      )}
+
+      {activeView === 'requests' && (
+        <MyRequestsView
+          profile={liveProfile}
+          requests={liveMyRequests}
+          loading={loadingRequests}
+          onOpenNewRequest={() => handleOpenNewRequest()}
+          onCancelPending={handleCancelPending}
+          onRequestModification={handleRequestModification}
+        />
+      )}
+
+      {activeView === 'management' &&
+        (liveProfile.role === 'executive' || liveProfile.role === 'manager') && (
+          <ManagementQueueView
+            currentProfile={liveProfile}
+            profiles={liveProfiles}
+            allRequests={activeAllRequests}
+            capacityMap={liveCapacityMap}
+            settings={liveSettings}
+            onApprove={handleApproveLeave}
+            onReject={handleRejectLeave}
+            onProcessModification={handleProcessModification}
+          />
+        )}
+
+      {activeView === 'directory' &&
+        (liveProfile.role === 'executive' || liveProfile.role === 'manager') && (
+          <StaffDirectoryView
+            profiles={liveProfiles}
+            allRequests={activeAllRequests}
+          />
+        )}
+
+      {activeView === 'reports' &&
+        (liveProfile.role === 'executive' || liveProfile.role === 'manager') && (
+          <ReportsView
+            allRequests={activeAllRequests}
+            profiles={liveProfiles}
+          />
+        )}
+
+      {activeView === 'admin' && liveProfile.role === 'manager' && (
+        <AdministrationView
+          currentProfile={liveProfile}
+          profiles={liveProfiles}
+          settings={liveSettings}
+          onUpdateStaff={handleUpdateStaff}
+          onRemoveStaff={handleRemoveStaff}
+          onUpdateSettings={handleUpdateSettings}
+        />
+      )}
+
+      {activeView === 'audit' && liveProfile.role === 'manager' && (
+        <AuditLogsView logs={liveAuditLogs} />
+      )}
+
+      {activeView === 'deployment' && liveProfile.role === 'manager' && (
+        <DeploymentSecurityView />
+      )}
+
+      <LeaveRequestModal
+        open={newReqModalOpen}
+        onClose={() => setNewReqModalOpen(false)}
+        staff={liveProfile}
+        userRequests={liveMyRequests}
+        capacityMap={liveCapacityMap}
+        pendingDemandMap={pendingDemandMap}
+        settings={liveSettings}
+        initialStartDate={prefillStart}
+        initialEndDate={prefillEnd}
+        onSubmit={handleSubmitLeave}
+      />
+
+      <ChangePasswordModal
+        open={mustForcePasswordChange || changePwdModalOpen}
+        forced={mustForcePasswordChange}
+        profile={liveProfile}
+        onSubmit={handleChangePassword}
+        onClose={() => setChangePwdModalOpen(false)}
+        onSignOut={handleSignOut}
+      />
+    </PortalShell>
+  );
+}

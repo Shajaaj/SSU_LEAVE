@@ -1,0 +1,6 @@
+{
+  "name": "Special Services Leave Management Portal",
+  "description": "Enterprise leave management, daily capacity governance, and scheduling portal for the Special Services Unit at Velana International Airport.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

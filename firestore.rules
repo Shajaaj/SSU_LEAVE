@@ -1,0 +1,397 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Default-Deny Perimeter
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Global Helpers
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidStaffId(id) {
+      return id is string && id.size() >= 2 && id.size() <= 24 && id.matches('^[A-Za-z0-9\\-]+$');
+    }
+
+    function isValidDateKey(d) {
+      return d is string && d.size() == 10 && d.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function callerHasLink() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/staffAuthLinks/$(request.auth.uid));
+    }
+
+    function callerLink() {
+      return get(/databases/$(database)/documents/staffAuthLinks/$(request.auth.uid)).data;
+    }
+
+    function isActiveCaller() {
+      return callerHasLink() && callerLink().isActive == true;
+    }
+
+    function callerStaffId() {
+      return callerLink().staffId;
+    }
+
+    function isExecutiveOrManager() {
+      return isActiveCaller() && callerLink().role in ['executive', 'manager'];
+    }
+
+    function isManager() {
+      return isActiveCaller() && callerLink().role == 'manager';
+    }
+
+    // 3. Entity Validation Blueprints (no resource/diff calls inside!)
+    function isValidStaffAuthLink(data, uid) {
+      return data.keys().hasAll(['uid', 'staffId', 'role', 'designation', 'isActive', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'staffId', 'role', 'designation', 'isActive', 'updatedAt'])
+        && data.uid == uid
+        && isValidId(data.uid)
+        && isValidStaffId(data.staffId)
+        && data.role in ['staff', 'executive', 'manager']
+        && data.designation in ['EXECUTIVE', 'OFFICER', 'ASSISTANT OFFICER', 'ATTENDANT', 'MANAGER']
+        && data.isActive is bool
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStaff(data, staffId) {
+      return data.keys().hasAll(['staffId', 'fullName', 'designation', 'role', 'isActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'staffId', 'authUid', 'authEmail', 'fullName', 'designation', 'role',
+          'passwordHash', 'isActive', 'mustChangePassword', 'unitSection',
+          'annualPeriodLimit', 'countsTowardDailyCap', 'createdAt', 'updatedAt'
+        ])
+        && data.staffId == staffId
+        && isValidStaffId(data.staffId)
+        && (!('authUid' in data) || (data.authUid is string && data.authUid.size() >= 1 && data.authUid.size() <= 128))
+        && (!('authEmail' in data) || (data.authEmail is string && data.authEmail.size() >= 5 && data.authEmail.size() <= 128))
+        && data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 100
+        && data.designation in ['EXECUTIVE', 'OFFICER', 'ASSISTANT OFFICER', 'ATTENDANT', 'MANAGER']
+        && data.role in ['staff', 'executive', 'manager']
+        && data.isActive is bool
+        && (!('mustChangePassword' in data) || data.mustChangePassword is bool)
+        && (!('unitSection' in data) || (data.unitSection is string && data.unitSection.size() >= 2 && data.unitSection.size() <= 60))
+        && (!('annualPeriodLimit' in data) || (data.annualPeriodLimit is int && data.annualPeriodLimit >= 1 && data.annualPeriodLimit <= 10))
+        && (!('countsTowardDailyCap' in data) || data.countsTowardDailyCap is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLeaveRequest(data, requestId) {
+      return data.keys().hasAll([
+          'requestId', 'staffId', 'staffName', 'designation', 'countsTowardDailyCap',
+          'leaveType', 'startDate', 'endDate', 'dates', 'daysCount', 'calendarYear',
+          'reason', 'status', 'modificationRequestType', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'requestId', 'uid', 'staffId', 'staffName', 'designation', 'countsTowardDailyCap',
+          'leaveType', 'startDate', 'endDate', 'dates', 'daysCount', 'calendarYear',
+          'reason', 'status', 'modificationRequestType', 'modificationNote',
+          'requestedStartDate', 'requestedEndDate', 'reviewedByStaffId',
+          'reviewedByName', 'reviewComment', 'lastAuditLogId', 'createdAt', 'updatedAt'
+        ])
+        && data.requestId == requestId
+        && isValidId(data.requestId)
+        && (!('uid' in data) || (data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128))
+        && isValidStaffId(data.staffId)
+        && data.staffName is string && data.staffName.size() >= 2 && data.staffName.size() <= 100
+        && data.designation in ['EXECUTIVE', 'OFFICER', 'ASSISTANT OFFICER', 'ATTENDANT', 'MANAGER']
+        && data.countsTowardDailyCap is bool
+        && data.leaveType == 'Annual Leave'
+        && isValidDateKey(data.startDate)
+        && isValidDateKey(data.endDate)
+        && data.startDate <= data.endDate
+        && data.dates is list && data.dates.size() >= 1 && data.dates.size() <= 30 && data.dates[0] is string
+        && data.daysCount is int && data.daysCount >= 1 && data.daysCount <= 30 && data.daysCount == data.dates.size()
+        && data.calendarYear is int && data.calendarYear >= 2020 && data.calendarYear <= 2100
+        && data.reason is string && data.reason.size() >= 3 && data.reason.size() <= 500
+        && data.status in ['pending', 'approved', 'rejected', 'cancelled']
+        && data.modificationRequestType in ['none', 'edit', 'cancel']
+        && (!('modificationNote' in data) || (data.modificationNote is string && data.modificationNote.size() <= 500))
+        && (!('requestedStartDate' in data) || (data.requestedStartDate is string && data.requestedStartDate.size() <= 10))
+        && (!('requestedEndDate' in data) || (data.requestedEndDate is string && data.requestedEndDate.size() <= 10))
+        && (!('reviewedByStaffId' in data) || (data.reviewedByStaffId is string && data.reviewedByStaffId.size() <= 24))
+        && (!('reviewedByName' in data) || (data.reviewedByName is string && data.reviewedByName.size() <= 100))
+        && (!('reviewComment' in data) || (data.reviewComment is string && data.reviewComment.size() <= 500))
+        && (!('lastAuditLogId' in data) || isValidId(data.lastAuditLogId))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDailyCapacity(data, dateKey) {
+      return data.keys().hasAll(['date', 'approvedCount', 'maxCapacity', 'updatedAt'])
+        && data.keys().hasOnly(['date', 'approvedCount', 'maxCapacity', 'updatedAt'])
+        && data.date == dateKey
+        && isValidDateKey(data.date)
+        && data.approvedCount is int
+        && data.maxCapacity is int
+        && data.maxCapacity >= 1
+        && data.maxCapacity <= 10
+        && data.approvedCount >= 0
+        && data.approvedCount <= data.maxCapacity
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDailyCapacityDetail(data, dateKey) {
+      return data.keys().hasAll(['date', 'allocations', 'updatedAt'])
+        && data.keys().hasOnly(['date', 'allocations', 'updatedAt'])
+        && data.date == dateKey
+        && isValidDateKey(data.date)
+        && data.allocations is list
+        && data.allocations.size() <= 25
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data, logId) {
+      return data.keys().hasAll([
+          'logId', 'action', 'targetType', 'targetId',
+          'actorStaffId', 'actorName', 'actorRole', 'summary', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'logId', 'action', 'targetType', 'targetId',
+          'actorStaffId', 'actorName', 'actorRole', 'summary',
+          'previousStatus', 'newStatus', 'affectedDates', 'createdAt'
+        ])
+        && data.logId == logId
+        && isValidId(data.logId)
+        && data.action in [
+          'LEAVE_SUBMITTED', 'LEAVE_APPROVED', 'LEAVE_REJECTED',
+          'LEAVE_CANCELLED', 'LEAVE_MODIFIED', 'MOD_REQUESTED',
+          'STAFF_PROVISIONED', 'STAFF_IMPORTED', 'STAFF_UPDATED',
+          'STAFF_DEACTIVATED', 'STAFF_REMOVED', 'SETTINGS_UPDATED',
+          'PASSWORD_UPDATED', 'PASSWORD_RESET_COMPLETED'
+        ]
+        && data.targetType in ['leaveRequest', 'staff', 'appSettings']
+        && data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 128
+        && data.actorStaffId is string && data.actorStaffId.size() >= 1 && data.actorStaffId.size() <= 24
+        && data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 100
+        && data.actorRole in ['staff', 'executive', 'manager']
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 300
+        && (!('previousStatus' in data) || (data.previousStatus is string && data.previousStatus.size() <= 30))
+        && (!('newStatus' in data) || (data.newStatus is string && data.newStatus.size() <= 30))
+        && (!('affectedDates' in data) || (data.affectedDates is list && data.affectedDates.size() <= 31))
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAppSettings(data) {
+      return data.keys().hasAll([
+          'maxDailyCombinedCap', 'maxAnnualLeavePeriods', 'pendingReservesCapacity',
+          'timezone', 'unitName', 'airportName', 'updatedByStaffId', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'maxDailyCombinedCap', 'maxAnnualLeavePeriods', 'pendingReservesCapacity',
+          'timezone', 'unitName', 'airportName', 'updatedByStaffId', 'updatedAt'
+        ])
+        && data.maxDailyCombinedCap is int && data.maxDailyCombinedCap >= 1 && data.maxDailyCombinedCap <= 10
+        && data.maxAnnualLeavePeriods is int && data.maxAnnualLeavePeriods >= 1 && data.maxAnnualLeavePeriods <= 10
+        && data.pendingReservesCapacity is bool
+        && data.timezone is string && data.timezone.size() >= 3 && data.timezone.size() <= 40
+        && data.unitName is string && data.unitName.size() >= 2 && data.unitName.size() <= 100
+        && data.airportName is string && data.airportName.size() >= 2 && data.airportName.size() <= 100
+        && data.updatedByStaffId is string && data.updatedByStaffId.size() >= 1 && data.updatedByStaffId.size() <= 24
+        && data.updatedAt is timestamp;
+    }
+
+    // 4. Collection Rules
+
+    // UID -> Staff ID & Role Link
+    match /staffAuthLinks/{uid} {
+      allow get: if isSignedIn() && isValidId(uid) && (request.auth.uid == uid || isManager());
+      allow list: if isManager();
+      allow create: if isManager()
+        && isValidId(uid)
+        && isValidStaffAuthLink(incoming(), uid)
+        && incoming().updatedAt == request.time;
+      allow update: if isManager()
+        && isValidId(uid)
+        && isValidStaffAuthLink(incoming(), uid)
+        && incoming().uid == existing().uid
+        && incoming().staffId == existing().staffId
+        && incoming().updatedAt == request.time;
+      allow delete: if isManager() && isValidId(uid) && uid != request.auth.uid;
+    }
+
+    // Employee Operational Profiles (zero plaintext passwords)
+    match /staff/{staffId} {
+      allow get: if isActiveCaller() && isValidStaffId(staffId) && (staffId == callerStaffId() || isExecutiveOrManager());
+      allow list: if isExecutiveOrManager();
+      allow create: if isManager()
+        && isValidStaffId(staffId)
+        && !('passwordHash' in incoming())
+        && isValidStaff(incoming(), staffId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidStaffId(staffId)
+        && isValidStaff(incoming(), staffId)
+        && incoming().staffId == existing().staffId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Self-service clearing of mustChangePassword after Firebase Auth password update
+          (
+            isActiveCaller()
+            && staffId == callerStaffId()
+            && existing().mustChangePassword == true
+            && incoming().mustChangePassword == false
+            && incoming().diff(existing()).affectedKeys().hasOnly(['mustChangePassword', 'updatedAt'])
+          )
+          // Manager editing operational attributes, role, or deactivation
+          || (
+            isManager()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'fullName', 'designation', 'role', 'isActive',
+              'unitSection', 'annualPeriodLimit', 'countsTowardDailyCap', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if isManager() && isValidStaffId(staffId) && staffId != callerStaffId();
+    }
+
+    // Annual Leave Applications
+    match /leaveRequests/{requestId} {
+      allow get: if isActiveCaller() && isValidId(requestId)
+        && (isExecutiveOrManager() || resource.data.staffId == callerStaffId());
+      allow list: if isActiveCaller()
+        && (isExecutiveOrManager() || resource.data.staffId == callerStaffId());
+
+      allow create: if isActiveCaller()
+        && isValidId(requestId)
+        && isValidLeaveRequest(incoming(), requestId)
+        && incoming().staffId == callerStaffId()
+        && incoming().uid == request.auth.uid
+        && incoming().status == 'pending'
+        && incoming().modificationRequestType == 'none'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/auditLogs/$(incoming().lastAuditLogId));
+
+      allow update: if isActiveCaller()
+        && isValidId(requestId)
+        && isValidLeaveRequest(incoming(), requestId)
+        && incoming().requestId == existing().requestId
+        && incoming().staffId == existing().staffId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/auditLogs/$(incoming().lastAuditLogId))
+        && (
+          // Action 1: Staff cancels own pending request
+          (
+            existing().staffId == callerStaffId()
+            && existing().status == 'pending'
+            && incoming().status == 'cancelled'
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'lastAuditLogId', 'updatedAt'])
+          )
+          // Action 2: Staff submits modification/cancellation request on own approved leave
+          || (
+            existing().staffId == callerStaffId()
+            && existing().status == 'approved'
+            && existing().modificationRequestType == 'none'
+            && incoming().status == 'approved'
+            && incoming().modificationRequestType in ['edit', 'cancel']
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'modificationRequestType', 'modificationNote',
+              'requestedStartDate', 'requestedEndDate', 'lastAuditLogId', 'updatedAt'
+            ])
+          )
+          // Action 3: Executive or Manager approves or rejects pending leave
+          || (
+            isExecutiveOrManager()
+            && existing().status == 'pending'
+            && incoming().status in ['approved', 'rejected']
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'reviewedByStaffId', 'reviewedByName',
+              'reviewComment', 'lastAuditLogId', 'updatedAt'
+            ])
+          )
+          // Action 4: Executive or Manager processes modification request on approved leave
+          || (
+            isExecutiveOrManager()
+            && existing().status == 'approved'
+            && existing().modificationRequestType != 'none'
+            && incoming().status in ['approved', 'cancelled']
+            && incoming().modificationRequestType == 'none'
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'startDate', 'endDate', 'dates', 'daysCount', 'calendarYear',
+              'modificationRequestType', 'modificationNote', 'requestedStartDate',
+              'requestedEndDate', 'reviewedByStaffId', 'reviewedByName',
+              'reviewComment', 'lastAuditLogId', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isManager() && isValidId(requestId);
+    }
+
+    // Daily Capacity Counters (max 10 enforced per date document)
+    match /dailyCapacity/{dateKey} {
+      allow get: if isActiveCaller() && isValidDateKey(dateKey);
+      allow list: if isActiveCaller();
+      allow create, update: if isExecutiveOrManager()
+        && isValidDateKey(dateKey)
+        && isValidDailyCapacity(incoming(), dateKey)
+        && incoming().updatedAt == request.time;
+      allow delete: if isManager() && isValidDateKey(dateKey);
+    }
+
+    // Daily Approved Allocations (summary for dashboard & calendar availability)
+    match /dailyCapacityDetails/{dateKey} {
+      allow get: if isActiveCaller() && isValidDateKey(dateKey);
+      allow list: if isActiveCaller();
+      allow create, update: if isExecutiveOrManager()
+        && isValidDateKey(dateKey)
+        && isValidDailyCapacityDetail(incoming(), dateKey)
+        && incoming().updatedAt == request.time;
+      allow delete: if isManager() && isValidDateKey(dateKey);
+    }
+
+    // Immutable Append-Only Audit Trail
+    match /auditLogs/{logId} {
+      allow get, list: if isManager();
+      allow create: if isActiveCaller()
+        && isValidId(logId)
+        && isValidAuditLog(incoming(), logId)
+        && incoming().actorStaffId == callerStaffId()
+        && incoming().actorRole == callerLink().role
+        && incoming().createdAt == request.time
+        && (
+          isManager()
+          || (isExecutiveOrManager() && incoming().action in [
+            'LEAVE_SUBMITTED', 'LEAVE_APPROVED', 'LEAVE_REJECTED',
+            'LEAVE_CANCELLED', 'LEAVE_MODIFIED', 'MOD_REQUESTED', 'PASSWORD_UPDATED'
+          ])
+          || incoming().action in [
+            'LEAVE_SUBMITTED', 'LEAVE_CANCELLED', 'MOD_REQUESTED', 'PASSWORD_UPDATED'
+          ]
+        );
+      allow update, delete: if false;
+    }
+
+    // Global Portal Settings
+    match /appSettings/{settingId} {
+      allow get: if isActiveCaller() && settingId == 'portalConfig';
+      allow list: if isActiveCaller();
+      allow create, update: if isManager()
+        && settingId == 'portalConfig'
+        && isValidAppSettings(incoming())
+        && incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+  }
+}

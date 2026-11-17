@@ -1,0 +1,452 @@
+{
+  "entities": {
+    "Staff": {
+      "title": "Staff",
+      "description": "Special Services Unit employee record keyed by exact Staff ID and linked to Firebase Authentication UID.",
+      "type": "object",
+      "properties": {
+        "staffId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 24,
+          "pattern": "^[A-Za-z0-9\\-]+$"
+        },
+        "authUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "authEmail": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 128
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100
+        },
+        "designation": {
+          "type": "string",
+          "enum": ["EXECUTIVE", "OFFICER", "ASSISTANT OFFICER", "ATTENDANT", "MANAGER"]
+        },
+        "role": {
+          "type": "string",
+          "enum": ["staff", "executive", "manager"]
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "mustChangePassword": {
+          "type": "boolean",
+          "description": "True when account uses an initial/reset temporary password and must update password on login."
+        },
+        "unitSection": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 60
+        },
+        "annualPeriodLimit": {
+          "type": "integer"
+        },
+        "countsTowardDailyCap": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "staffId",
+        "fullName",
+        "designation",
+        "role",
+        "isActive",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StaffAuthLink": {
+      "title": "StaffAuthLink",
+      "description": "Zero-trust RBAC binding keyed by Firebase Authentication UID linking each authenticated user to their Staff ID and role.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "staffId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 24,
+          "pattern": "^[A-Za-z0-9\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["staff", "executive", "manager"]
+        },
+        "designation": {
+          "type": "string",
+          "enum": ["EXECUTIVE", "OFFICER", "ASSISTANT OFFICER", "ATTENDANT", "MANAGER"]
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "staffId", "role", "designation", "isActive", "updatedAt"]
+    },
+    "LeaveRequest": {
+      "title": "LeaveRequest",
+      "description": "Annual Leave application with date-only YYYY-MM-DD fields in Maldives time (Asia/Male, UTC+5).",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "staffId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 24,
+          "pattern": "^[A-Za-z0-9\\-]+$"
+        },
+        "staffName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100
+        },
+        "designation": {
+          "type": "string",
+          "enum": ["EXECUTIVE", "OFFICER", "ASSISTANT OFFICER", "ATTENDANT", "MANAGER"]
+        },
+        "countsTowardDailyCap": {
+          "type": "boolean"
+        },
+        "leaveType": {
+          "type": "string",
+          "enum": ["Annual Leave"]
+        },
+        "startDate": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "endDate": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "dates": {
+          "type": "array",
+          "description": "List of YYYY-MM-DD dates covered by this request (max 30)."
+        },
+        "daysCount": {
+          "type": "integer"
+        },
+        "calendarYear": {
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 500
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "approved", "rejected", "cancelled"]
+        },
+        "modificationRequestType": {
+          "type": "string",
+          "enum": ["none", "edit", "cancel"]
+        },
+        "modificationNote": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "requestedStartDate": {
+          "type": "string",
+          "maxLength": 10
+        },
+        "requestedEndDate": {
+          "type": "string",
+          "maxLength": 10
+        },
+        "reviewedByStaffId": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "reviewedByName": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "reviewComment": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "lastAuditLogId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "requestId",
+        "staffId",
+        "staffName",
+        "designation",
+        "countsTowardDailyCap",
+        "leaveType",
+        "startDate",
+        "endDate",
+        "dates",
+        "daysCount",
+        "calendarYear",
+        "reason",
+        "status",
+        "modificationRequestType",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DailyCapacity": {
+      "title": "DailyCapacity",
+      "description": "Atomic daily capacity counter (max 10 combined allocations for Assistant Officers and Attendants).",
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "approvedCount": {
+          "type": "integer"
+        },
+        "maxCapacity": {
+          "type": "integer"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["date", "approvedCount", "maxCapacity", "updatedAt"]
+    },
+    "DailyCapacityDetail": {
+      "title": "DailyCapacityDetail",
+      "description": "Approved staff allocations for a given calendar date.",
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "allocations": {
+          "type": "array",
+          "description": "Bounded list (max 25) of approved allocation summaries."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["date", "allocations", "updatedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable append-only audit trail for leave decisions and administration changes.",
+      "type": "object",
+      "properties": {
+        "logId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "LEAVE_SUBMITTED",
+            "LEAVE_APPROVED",
+            "LEAVE_REJECTED",
+            "LEAVE_CANCELLED",
+            "LEAVE_MODIFIED",
+            "MOD_REQUESTED",
+            "STAFF_PROVISIONED",
+            "STAFF_IMPORTED",
+            "STAFF_UPDATED",
+            "STAFF_DEACTIVATED",
+            "STAFF_REMOVED",
+            "SETTINGS_UPDATED",
+            "PASSWORD_UPDATED",
+            "PASSWORD_RESET_COMPLETED"
+          ]
+        },
+        "targetType": {
+          "type": "string",
+          "enum": ["leaveRequest", "staff", "appSettings"]
+        },
+        "targetId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "actorStaffId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "actorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "actorRole": {
+          "type": "string",
+          "enum": ["staff", "executive", "manager"]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "previousStatus": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "newStatus": {
+          "type": "string",
+          "maxLength": 30
+        },
+        "affectedDates": {
+          "type": "array",
+          "description": "Optional list of YYYY-MM-DD dates affected (max 31)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "logId",
+        "action",
+        "targetType",
+        "targetId",
+        "actorStaffId",
+        "actorName",
+        "actorRole",
+        "summary",
+        "createdAt"
+      ]
+    },
+    "AppSettings": {
+      "title": "AppSettings",
+      "description": "Application configuration for leave capacity and policy.",
+      "type": "object",
+      "properties": {
+        "maxDailyCombinedCap": {
+          "type": "integer"
+        },
+        "maxAnnualLeavePeriods": {
+          "type": "integer"
+        },
+        "pendingReservesCapacity": {
+          "type": "boolean"
+        },
+        "timezone": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 40
+        },
+        "unitName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100
+        },
+        "airportName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100
+        },
+        "updatedByStaffId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "maxDailyCombinedCap",
+        "maxAnnualLeavePeriods",
+        "pendingReservesCapacity",
+        "timezone",
+        "unitName",
+        "airportName",
+        "updatedByStaffId",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/staff/{staffId}": {
+      "schema": { "$ref": "#/entities/Staff" },
+      "description": "Employee operational records keyed by exact Staff ID and linked to Firebase Auth UID."
+    },
+    "/staffAuthLinks/{uid}": {
+      "schema": { "$ref": "#/entities/StaffAuthLink" },
+      "description": "Firebase Auth UID -> Staff ID + Role mapping enforced by Firestore Security Rules."
+    },
+    "/leaveRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/LeaveRequest" },
+      "description": "Staff Annual Leave applications with date-only fields and status lifecycle."
+    },
+    "/dailyCapacity/{dateKey}": {
+      "schema": { "$ref": "#/entities/DailyCapacity" },
+      "description": "Daily approved leave slot counters (max 10 for Assistant Officers & Attendants)."
+    },
+    "/dailyCapacityDetails/{dateKey}": {
+      "schema": { "$ref": "#/entities/DailyCapacityDetail" },
+      "description": "Daily approved staff allocation details."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Append-only immutable audit logs of decisions and administrative actions."
+    },
+    "/appSettings/{settingId}": {
+      "schema": { "$ref": "#/entities/AppSettings" },
+      "description": "Global unit leave rules and portal settings."
+    }
+  }
+}
