@@ -32,7 +32,7 @@ service cloud.firestore {
     function isSignedIn() {
       return request.auth != null
         && (
-          request.auth.token.firebase.sign_in_provider == 'custom'
+          ('firebase' in request.auth.token && request.auth.token.firebase.sign_in_provider == 'custom')
           || ('email_verified' in request.auth.token && request.auth.token.email_verified == true)
         );
     }
@@ -160,6 +160,7 @@ service cloud.firestore {
         && isValidDateKey(data.date)
         && data.allocations is list
         && data.allocations.size() <= 25
+        && (data.allocations.size() == 0 || data.allocations[0] is map)
         && data.updatedAt is timestamp;
     }
 
@@ -187,7 +188,7 @@ service cloud.firestore {
         && data.actorStaffId is string && data.actorStaffId.size() >= 1 && data.actorStaffId.size() <= 24
         && data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 100
         && data.actorRole in ['staff', 'executive', 'manager']
-        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 300
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 650
         && (!('previousStatus' in data) || (data.previousStatus is string && data.previousStatus.size() <= 30))
         && (!('newStatus' in data) || (data.newStatus is string && data.newStatus.size() <= 30))
         && (!('affectedDates' in data) || (data.affectedDates is list && data.affectedDates.size() <= 31))
@@ -228,6 +229,10 @@ service cloud.firestore {
         && isValidStaffAuthLink(incoming(), uid)
         && incoming().uid == existing().uid
         && incoming().staffId == existing().staffId
+        && (
+          uid != request.auth.uid
+          || (incoming().role == existing().role && incoming().isActive == existing().isActive)
+        )
         && incoming().updatedAt == request.time;
       allow delete: if isManager() && isValidId(uid) && uid != request.auth.uid;
     }
@@ -253,6 +258,10 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && isManager()
+        && (
+          staffId != callerStaffId()
+          || (incoming().role == existing().role && incoming().isActive == existing().isActive)
+        )
         && incoming().diff(existing()).affectedKeys().hasOnly([
           'fullName', 'designation', 'role', 'isActive',
           'unitSection', 'annualPeriodLimit', 'countsTowardDailyCap', 'updatedAt'
@@ -272,8 +281,15 @@ service cloud.firestore {
         && isValidLeaveRequest(incoming(), requestId)
         && incoming().staffId == callerStaffId()
         && incoming().uid == request.auth.uid
+        && incoming().designation == callerLink().designation
+        && incoming().countsTowardDailyCap == (callerLink().designation in ['ASSISTANT OFFICER', 'ATTENDANT'])
         && incoming().status == 'pending'
         && incoming().modificationRequestType == 'none'
+        && !('reviewedByStaffId' in incoming())
+        && !('reviewedByName' in incoming())
+        && !('reviewComment' in incoming())
+        && 'lastAuditLogId' in incoming()
+        && isValidId(incoming().lastAuditLogId)
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
         && existsAfter(/databases/$(database)/documents/auditLogs/$(incoming().lastAuditLogId));
@@ -283,8 +299,12 @@ service cloud.firestore {
         && isValidLeaveRequest(incoming(), requestId)
         && incoming().requestId == existing().requestId
         && incoming().staffId == existing().staffId
+        && incoming().designation == existing().designation
+        && incoming().countsTowardDailyCap == existing().countsTowardDailyCap
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
+        && 'lastAuditLogId' in incoming()
+        && isValidId(incoming().lastAuditLogId)
         && existsAfter(/databases/$(database)/documents/auditLogs/$(incoming().lastAuditLogId))
         && (
           // Action 1: Staff cancels own pending request
@@ -301,28 +321,47 @@ service cloud.firestore {
             && existing().modificationRequestType == 'none'
             && incoming().status == 'approved'
             && incoming().modificationRequestType in ['edit', 'cancel']
+            && incoming().modificationNote is string
+            && incoming().modificationNote.size() >= 3
+            && (
+              (
+                incoming().modificationRequestType == 'edit'
+                && isValidDateKey(incoming().requestedStartDate)
+                && isValidDateKey(incoming().requestedEndDate)
+                && incoming().requestedStartDate <= incoming().requestedEndDate
+              )
+              || (
+                incoming().modificationRequestType == 'cancel'
+                && incoming().requestedStartDate == ''
+                && incoming().requestedEndDate == ''
+              )
+            )
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'modificationRequestType', 'modificationNote',
               'requestedStartDate', 'requestedEndDate', 'lastAuditLogId', 'updatedAt'
             ])
           )
-          // Action 3: Executive or Manager approves or rejects pending leave
+          // Action 3: Executive or Manager approves or rejects another staff member's pending leave
           || (
             isExecutiveOrManager()
+            && existing().staffId != callerStaffId()
             && existing().status == 'pending'
             && incoming().status in ['approved', 'rejected']
+            && incoming().reviewedByStaffId == callerStaffId()
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'reviewedByStaffId', 'reviewedByName',
               'reviewComment', 'lastAuditLogId', 'updatedAt'
             ])
           )
-          // Action 4: Executive or Manager processes modification request on approved leave
+          // Action 4: Executive or Manager processes modification request on another staff member's approved leave
           || (
             isExecutiveOrManager()
+            && existing().staffId != callerStaffId()
             && existing().status == 'approved'
             && existing().modificationRequestType != 'none'
             && incoming().status in ['approved', 'cancelled']
             && incoming().modificationRequestType == 'none'
+            && incoming().reviewedByStaffId == callerStaffId()
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'startDate', 'endDate', 'dates', 'daysCount', 'calendarYear',
               'modificationRequestType', 'modificationNote', 'requestedStartDate',
@@ -382,10 +421,11 @@ service cloud.firestore {
     // Global Portal Settings
     match /appSettings/{settingId} {
       allow get: if isActiveCaller() && settingId == 'portalConfig';
-      allow list: if isActiveCaller();
+      allow list: if isExecutiveOrManager();
       allow create, update: if isManager()
         && settingId == 'portalConfig'
         && isValidAppSettings(incoming())
+        && incoming().updatedByStaffId == callerStaffId()
         && incoming().updatedAt == request.time;
       allow delete: if false;
     }

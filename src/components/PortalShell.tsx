@@ -371,8 +371,8 @@ export const PortalShell: React.FC<PortalShellProps> = ({
         <main
           className={
             activeView === 'dashboard'
-              ? 'flex-1 w-full mx-auto px-3 sm:px-5 py-3 flex flex-col min-h-0 lg:overflow-hidden'
-              : 'flex-1 max-w-[1360px] w-full mx-auto px-4 sm:px-6 py-6 space-y-6'
+              ? 'flex-1 min-w-0 w-full mx-auto px-3 sm:px-5 py-3 flex flex-col min-h-0 lg:overflow-hidden'
+              : 'flex-1 min-w-0 max-w-[1360px] w-full mx-auto px-4 sm:px-6 py-6 space-y-6'
           }
         >
           {children}

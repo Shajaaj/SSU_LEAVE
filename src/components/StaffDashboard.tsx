@@ -106,7 +106,6 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [showAllUnitStaff, setShowAllUnitStaff] = useState(false);
-  const [mobileShowEmptyDays, setMobileShowEmptyDays] = useState(false);
   const [selectedSpan, setSelectedSpan] = useState<TimelineSpan | null>(null);
 
   const meta = useMemo(
@@ -364,37 +363,8 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
     onChangeMonth(y, m);
   };
 
-  // Group active spans per date for clean mobile day-by-day roster cards
-  const mobileDayRoster = useMemo(() => {
-    const query = searchTerm.trim().toLowerCase();
-    return dayColumns
-      .map((col) => {
-        const activeSpans: TimelineSpan[] = [];
-        for (const r of rows) {
-          for (const sp of r.spans) {
-            if (col.colIndex >= sp.startCol && col.colIndex <= sp.endCol) {
-              if (
-                !query ||
-                sp.staffName.toLowerCase().includes(query) ||
-                sp.staffId.toLowerCase().includes(query)
-              ) {
-                activeSpans.push(sp);
-              }
-            }
-          }
-        }
-        return {
-          ...col,
-          spans: activeSpans,
-          usedCap: capacityMap[col.dateKey]?.approvedCount || 0,
-          limitCap: capacityMap[col.dateKey]?.maxCapacity || maxCap,
-        };
-      })
-      .filter((d) => mobileShowEmptyDays || d.spans.length > 0 || d.isToday);
-  }, [dayColumns, rows, searchTerm, capacityMap, maxCap, mobileShowEmptyDays]);
-
   return (
-    <div className="flex-1 min-h-0 flex flex-col gap-2.5">
+    <div className="flex-1 min-w-0 min-h-0 flex flex-col gap-2.5">
       {/* Top Toolbar: Year & Month Selectors (matching reference layout) + Search & Legend */}
       <div className="shrink-0 flex flex-wrap items-center justify-between gap-2.5">
         <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
@@ -528,7 +498,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
             <button
               type="button"
               onClick={() => setShowAllUnitStaff((v) => !v)}
-              className={`px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+              className={`min-h-[38px] sm:min-h-0 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
                 showAllUnitStaff
                   ? 'bg-[#0B1F3A] text-white border-[#0B1F3A] dark:bg-teal-600 dark:border-teal-600'
                   : 'bg-white dark:bg-[#0D1B2A] text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800'
@@ -555,138 +525,13 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
         </div>
       </div>
 
-      {/* Mobile-First Day-by-Day Leave Roster Cards (< 768px) */}
-      <div className="md:hidden space-y-2.5 pb-4">
-        <div className="flex items-center justify-between gap-2 px-1">
-          <p className="text-xs font-semibold text-slate-600 dark:text-slate-300">
-            {rows.length} staff with leave in {meta.label}
-          </p>
-          <button
-            type="button"
-            onClick={() => setMobileShowEmptyDays((v) => !v)}
-            className="min-h-[36px] px-2.5 py-1 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0D1B2A] text-xs font-medium text-slate-700 dark:text-slate-200"
-          >
-            {mobileShowEmptyDays ? 'Days with Leave Only' : 'Show All Days'}
-          </button>
-        </div>
-
-        {mobileDayRoster.length === 0 ? (
-          <div className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-xl p-6 text-center space-y-2.5">
-            <CalendarDays
-              className="w-7 h-7 text-slate-400 mx-auto"
-              aria-hidden="true"
-            />
-            <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
-              No staff on leave in {meta.label}
-            </p>
-            <button
-              type="button"
-              onClick={() => onOpenNewRequest(meta.startDate, meta.startDate)}
-              className="min-h-[44px] px-4 py-2 rounded-lg bg-teal-600 text-white text-xs font-semibold inline-flex items-center gap-1.5"
-            >
-              <Plus className="w-4 h-4" aria-hidden="true" />
-              <span>New Leave Request</span>
-            </button>
-          </div>
-        ) : (
-          mobileDayRoster.map((day) => {
-            const isFull = day.usedCap >= day.limitCap;
-            return (
-              <div
-                key={day.dateKey}
-                className={`rounded-xl border overflow-hidden ${
-                  day.isToday
-                    ? 'border-teal-500 bg-teal-50/30 dark:bg-teal-950/20'
-                    : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D1B2A]'
-                }`}
-              >
-                <div className="px-3.5 py-2.5 bg-slate-50/90 dark:bg-[#091526] border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-mono font-bold text-[#0B1F3A] dark:text-white">
-                      {day.weekday}, {formatDisplayDate(day.dateKey)}
-                    </span>
-                    {day.isToday && (
-                      <span className="text-[11px] font-semibold text-teal-700 dark:text-teal-400">
-                        · Today
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`text-xs font-mono tabular-nums font-bold ${
-                        isFull
-                          ? 'text-red-700 dark:text-red-400'
-                          : 'text-slate-600 dark:text-slate-300'
-                      }`}
-                    >
-                      {day.usedCap}/{day.limitCap}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => onOpenNewRequest(day.dateKey, day.dateKey)}
-                      className="min-h-[36px] px-2.5 py-1 rounded-md bg-teal-600 hover:bg-teal-700 text-white text-[11px] font-semibold whitespace-nowrap"
-                    >
-                      + Apply
-                    </button>
-                  </div>
-                </div>
-
-                {day.spans.length === 0 ? (
-                  <p className="px-3.5 py-2.5 text-xs text-slate-400 dark:text-slate-500">
-                    No staff on leave
-                  </p>
-                ) : (
-                  <div className="divide-y divide-slate-100 dark:divide-slate-800">
-                    {day.spans.map((sp) => (
-                      <button
-                        key={`${day.dateKey}_${sp.key}`}
-                        type="button"
-                        onClick={() => setSelectedSpan(sp)}
-                        className="w-full min-h-[48px] px-3.5 py-2 text-left flex items-center justify-between gap-3 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors"
-                      >
-                        <div className="min-w-0">
-                          <p className="text-xs font-semibold text-slate-900 dark:text-slate-100 truncate">
-                            {sp.staffName}
-                            {sp.isMine && (
-                              <span className="ml-1.5 text-teal-700 dark:text-teal-400">
-                                (You)
-                              </span>
-                            )}
-                          </p>
-                          <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate font-mono">
-                            {sp.staffId} · {sp.leaveType} ·{' '}
-                            {formatDisplayDate(sp.startDate)} –{' '}
-                            {formatDisplayDate(sp.endDate)}
-                          </p>
-                        </div>
-                        <span
-                          className={`shrink-0 px-2 py-0.5 rounded text-[10px] font-semibold border ${
-                            sp.hasModPending
-                              ? 'bg-[#D8DADF] dark:bg-slate-700 border-slate-400 text-slate-800 dark:text-slate-200'
-                              : sp.status === 'pending'
-                                ? 'bg-[#F5D7A1]/60 dark:bg-amber-500/20 border-amber-500/50 text-amber-900 dark:text-amber-200'
-                                : 'bg-[#9CD3A4]/50 dark:bg-emerald-500/20 border-emerald-600/40 text-emerald-900 dark:text-emerald-200'
-                          }`}
-                        >
-                          {sp.status === 'approved' ? 'Approved' : 'Pending'}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })
-        )}
-      </div>
-
-      {/* Desktop & Tablet Full-Month Horizontal Staff Timeline Matrix (>= 768px) */}
-      <div className="hidden md:flex flex-1 min-h-[520px] lg:min-h-0 flex-col bg-[#EEF2F7] dark:bg-[#0D1B2A] border-2 border-[#233B6E] dark:border-slate-700 rounded-md overflow-hidden shadow-xs">
+      {/* Full-Month Horizontal Staff Timeline Matrix (Mobile, Tablet & Desktop) */}
+      <div className="flex flex-1 min-h-[420px] sm:min-h-[520px] lg:min-h-0 flex-col bg-[#EEF2F7] dark:bg-[#0D1B2A] border-2 border-[#233B6E] dark:border-slate-700 rounded-md overflow-hidden shadow-xs">
         <div className="flex-1 min-h-0 overflow-x-auto overflow-y-auto flex flex-col">
-          <div className="min-w-[780px] lg:min-w-0 w-full flex-1 flex flex-col">
+          <div className="min-w-[820px] lg:min-w-0 w-full flex-1 flex flex-col">
             {/* Sticky Day Header Row */}
             <div className="sticky top-0 z-20 flex bg-[#E8EEF5] dark:bg-[#0B1F3A] border-b-2 border-[#0B1F3A] dark:border-slate-600 shrink-0">
-              <div className="sticky left-0 z-30 w-[152px] xl:w-[185px] shrink-0 bg-[#E8EEF5] dark:bg-[#0B1F3A] border-r border-slate-300 dark:border-slate-700 px-3 py-1.5 flex items-end justify-between">
+              <div className="sticky left-0 z-30 w-[128px] sm:w-[152px] xl:w-[185px] shrink-0 bg-[#E8EEF5] dark:bg-[#0B1F3A] border-r border-slate-300 dark:border-slate-700 px-2.5 sm:px-3 py-1.5 flex items-end justify-between">
                 <span className="text-[11px] font-semibold text-[#0B1F3A] dark:text-slate-200 truncate">
                   Staff ({rows.length})
                 </span>
@@ -768,7 +613,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
                   >
                     {/* Sticky Staff Name Column */}
                     <div
-                      className={`sticky left-0 z-10 w-[152px] xl:w-[185px] shrink-0 border-r border-slate-300 dark:border-slate-700 px-2.5 py-1 flex items-center justify-between gap-1.5 ${
+                      className={`sticky left-0 z-10 w-[128px] sm:w-[152px] xl:w-[185px] shrink-0 border-r border-slate-300 dark:border-slate-700 px-2 sm:px-2.5 py-1 flex items-center justify-between gap-1.5 ${
                         row.isMine
                           ? 'bg-[#EAF7F5] dark:bg-[#0D262A]'
                           : rowIdx % 2 === 1
@@ -864,7 +709,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
 
             {/* Sticky Bottom Daily Capacity Summary Row */}
             <div className="sticky bottom-0 z-20 flex bg-[#E8EEF5] dark:bg-[#0B1F3A] border-t-2 border-[#0B1F3A] dark:border-slate-600 shrink-0">
-              <div className="sticky left-0 z-30 w-[152px] xl:w-[185px] shrink-0 bg-[#E8EEF5] dark:bg-[#0B1F3A] border-r border-slate-300 dark:border-slate-700 px-3 py-1 flex items-center justify-between">
+              <div className="sticky left-0 z-30 w-[128px] sm:w-[152px] xl:w-[185px] shrink-0 bg-[#E8EEF5] dark:bg-[#0B1F3A] border-r border-slate-300 dark:border-slate-700 px-2.5 sm:px-3 py-1 flex items-center justify-between">
                 <span className="text-[10px] font-semibold text-[#0B1F3A] dark:text-slate-200 truncate">
                   Daily Cap ({maxCap} max)
                 </span>
