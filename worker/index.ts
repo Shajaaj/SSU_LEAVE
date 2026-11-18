@@ -1015,6 +1015,7 @@ export default {
             ok: true,
             projectId: env.FIREBASE_PROJECT_ID || 'ss-leave-management',
             configured: Boolean(env.FIREBASE_SERVICE_ACCOUNT_KEY?.trim()),
+            availableBindings: Object.keys(env),
           });
         }
         if (request.method === 'POST' && url.pathname === '/api/auth/login') {
