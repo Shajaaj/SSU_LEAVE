@@ -40,6 +40,8 @@ jobs:
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
 
       - name: Install dependencies (frozen lockfile)
         run: bun install --frozen-lockfile
@@ -56,7 +58,7 @@ jobs:
       - name: Validate CSV rows & Staff ID collisions (offline, no secrets)
         env:
           ROSTER_PATH: ${{ inputs.roster_path }}
-        run: npx tsx scripts/adminStaffAuth.ts import "$ROSTER_PATH" --validate-only
+        run: ./node_modules/.bin/tsx scripts/adminStaffAuth.ts import "$ROSTER_PATH" --validate-only
 
   import:
     name: Idempotent Staff Roster Import (ss-leave-management)
@@ -92,6 +94,8 @@ jobs:
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
 
       - name: Install dependencies (frozen lockfile)
         run: bun install --frozen-lockfile
@@ -103,4 +107,4 @@ jobs:
           INITIAL_STAFF_PIN: '1234'
         run: |
           echo "::add-mask::$INITIAL_STAFF_PIN"
-          npx tsx scripts/adminStaffAuth.ts import "$ROSTER_PATH"
+          ./node_modules/.bin/tsx scripts/adminStaffAuth.ts import "$ROSTER_PATH"
