@@ -33,6 +33,7 @@ import {
   rejectLeaveRequest,
   removeStaffAccount,
   requestLeaveModification,
+  resetStaffPinByManager,
   resolveSignedInStaffProfile,
   submitLeaveRequest,
   subscribeAllRequests,
@@ -436,11 +437,21 @@ export default function App() {
   ) => {
     if (!liveProfile) return;
     await changeOwnPassword(liveProfile, currentPassword, newPassword);
+    setLiveProfile((prev) => (prev ? { ...prev, mustChangePassword: false } : prev));
     setChangePwdModalOpen(false);
     addToast(
       'success',
-      'Password Updated',
-      'Your personal password has been updated in Firebase Authentication.'
+      'PIN Updated',
+      'Your personal PIN has been saved centrally and applies on every device.'
+    );
+  };
+
+  const handleResetStaffPin = async (target: StaffProfile, tempPin: string) => {
+    await resetStaffPinByManager(target.staffId, tempPin);
+    addToast(
+      'success',
+      'Temporary PIN Assigned',
+      `${target.fullName} (${target.staffId}) must set a new personal PIN on next login.`
     );
   };
 
@@ -580,6 +591,7 @@ export default function App() {
           settings={liveSettings}
           onUpdateStaff={handleUpdateStaff}
           onRemoveStaff={handleRemoveStaff}
+          onResetStaffPin={handleResetStaffPin}
           onUpdateSettings={handleUpdateSettings}
         />
       )}

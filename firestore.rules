@@ -30,7 +30,11 @@ service cloud.firestore {
     }
 
     function isSignedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
+      return request.auth != null
+        && (
+          request.auth.token.firebase.sign_in_provider == 'custom'
+          || ('email_verified' in request.auth.token && request.auth.token.email_verified == true)
+        );
     }
 
     function callerHasLink() {
@@ -228,7 +232,12 @@ service cloud.firestore {
       allow delete: if isManager() && isValidId(uid) && uid != request.auth.uid;
     }
 
-    // Employee Operational Profiles (zero plaintext passwords)
+    // Server-Only Hashed PIN Credentials & Rate-Limit Lockout State (denied to all client SDKs)
+    match /staffPinSecrets/{staffId} {
+      allow read, write: if false;
+    }
+
+    // Employee Operational Profiles (zero plaintext PINs or hashes)
     match /staff/{staffId} {
       allow get: if isActiveCaller() && isValidStaffId(staffId) && (staffId == callerStaffId() || isExecutiveOrManager());
       allow list: if isExecutiveOrManager();
@@ -243,24 +252,11 @@ service cloud.firestore {
         && incoming().staffId == existing().staffId
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && (
-          // Self-service clearing of mustChangePassword after Firebase Auth password update
-          (
-            isActiveCaller()
-            && staffId == callerStaffId()
-            && existing().mustChangePassword == true
-            && incoming().mustChangePassword == false
-            && incoming().diff(existing()).affectedKeys().hasOnly(['mustChangePassword', 'updatedAt'])
-          )
-          // Manager editing operational attributes, role, or deactivation
-          || (
-            isManager()
-            && incoming().diff(existing()).affectedKeys().hasOnly([
-              'fullName', 'designation', 'role', 'isActive',
-              'unitSection', 'annualPeriodLimit', 'countsTowardDailyCap', 'updatedAt'
-            ])
-          )
-        );
+        && isManager()
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'fullName', 'designation', 'role', 'isActive',
+          'unitSection', 'annualPeriodLimit', 'countsTowardDailyCap', 'updatedAt'
+        ]);
       allow delete: if isManager() && isValidStaffId(staffId) && staffId != callerStaffId();
     }
 

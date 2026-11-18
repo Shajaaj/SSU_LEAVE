@@ -1,40 +1,78 @@
 import path from 'node:path';
 import { FieldValue } from 'firebase-admin/firestore';
 import {
-  assertNoAuthEmailCollisions,
+  INITIAL_STAFF_ROSTER,
+  deriveDefaultRole,
+  doesDesignationCountTowardDailyCap,
+} from './initialStaffRoster.ts';
+import {
+  assertNoStaffUidCollisions,
   escapeCsvCell,
-  generateTemporaryPassword,
+  generateRandomPin,
   getAdminContext,
+  hashPinPbkdf2Node,
+  resolveInitialPinFromCliOrEnv,
   writeRestrictedFile,
 } from './adminContext.ts';
 
-interface MigrationCredentialRow {
+interface RandomCredentialRow {
   staffId: string;
   fullName: string;
   designation: string;
   role: string;
   authUid: string;
-  authEmail: string;
-  temporaryPassword: string;
+  temporaryPin: string;
   status: string;
 }
 
 async function main() {
-  const args = new Set(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const args = new Set(argv);
   const dryRun = args.has('--dry-run');
-  const resetAllPasswords = args.has('--reset-all-passwords');
+  const resetAllPins = args.has('--reset-all-pins') || args.has('--reset-all-passwords');
   const stripLegacyHashes = args.has('--strip-legacy-hashes');
+  const randomPins = args.has('--random');
+  const seedRoster = args.has('--seed-initial-roster');
 
-  const { auth, db, projectId, databaseId } = getAdminContext();
+  const { db, projectId, databaseId } = getAdminContext();
   console.log(`Connected to Firebase project="${projectId}", database="${databaseId}"`);
   console.log(
-    `Mode: dryRun=${dryRun}, resetAllPasswords=${resetAllPasswords}, stripLegacyHashes=${stripLegacyHashes}`
+    `Mode: dryRun=${dryRun}, resetAllPins=${resetAllPins}, randomPins=${randomPins}, stripLegacyHashes=${stripLegacyHashes}, seedRoster=${seedRoster}`
   );
+
+  if (!dryRun && seedRoster) {
+    let seededCount = 0;
+    for (const row of INITIAL_STAFF_ROSTER) {
+      const ref = db.collection('staff').doc(row.staffId);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        await ref.set({
+          staffId: row.staffId,
+          fullName: row.fullName,
+          designation: row.designation,
+          role: row.role || deriveDefaultRole(row.staffId, row.designation),
+          isActive: true,
+          mustChangePassword: true,
+          unitSection: 'Special Services',
+          annualPeriodLimit: 3,
+          countsTowardDailyCap: doesDesignationCountTowardDailyCap(row.designation),
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        seededCount += 1;
+      }
+    }
+    console.log(
+      `Roster check complete: seeded ${seededCount} missing staff record(s) without overwriting existing docs.`
+    );
+  }
 
   // 1. Read all existing staff documents without overwriting or deleting any records
   const staffSnap = await db.collection('staff').get();
   if (staffSnap.empty) {
-    console.log('No documents found in "staff" collection. Nothing to migrate.');
+    console.log(
+      'No documents found in "staff" collection. Restore your Firestore staff export first or pass --seed-initial-roster / run `adminStaffAuth.ts import <roster.csv>`.'
+    );
     return;
   }
 
@@ -47,10 +85,16 @@ async function main() {
 
   console.log(`Found ${staffDocs.length} existing staff record(s) in Firestore.`);
 
-  // 2. Check deterministic internal auth identifier collisions before mutating anything
+  // 2. Check deterministic UID collisions before mutating anything
   const staffIds = staffDocs.map((s) => String(s.data.staffId || s.docId));
-  const staffEmailMap = assertNoAuthEmailCollisions(staffIds);
+  const staffUidMap = assertNoStaffUidCollisions(staffIds);
   console.log('Collision check passed: 0 Staff ID normalization collisions.');
+
+  // Resolve uniform initial PIN from --pin, INITIAL_STAFF_PIN, or interactive prompt unless --dry-run / --random
+  let uniformInitialPin = '';
+  if (!dryRun && !randomPins) {
+    uniformInitialPin = await resolveInitialPinFromCliOrEnv(argv);
+  }
 
   // 3. Create restricted local backup JSON before migration
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -82,11 +126,11 @@ async function main() {
     console.log('Initialized missing appSettings/portalConfig document.');
   }
 
-  // 4. Provision/link Firebase Authentication users and staffAuthLinks/{uid}
-  const credentialsOut: MigrationCredentialRow[] = [];
-  let createdAuthCount = 0;
-  let linkedExistingCount = 0;
-  let updatedPasswordCount = 0;
+  // 4. Provision/link staffAuthLinks/{uid} and server-only PBKDF2 staffPinSecrets/{staffId}
+  const randomOut: RandomCredentialRow[] = [];
+  let createdSecretCount = 0;
+  let preservedSecretCount = 0;
+  let resetSecretCount = 0;
 
   for (const { docId, data } of staffDocs) {
     const staffId = String(data.staffId || docId);
@@ -94,71 +138,66 @@ async function main() {
     const designation = String(data.designation || 'ASSISTANT OFFICER');
     const role = String(data.role || 'staff');
     const isActive = data.isActive !== false;
-    const authEmail = staffEmailMap.get(staffId)!;
+    const uid = String(data.authUid || staffUidMap.get(staffId)!);
 
-    let existingAuthUser = null;
-    try {
-      existingAuthUser = await auth.getUserByEmail(authEmail);
-    } catch (err: unknown) {
-      const code = (err as { code?: string })?.code;
-      if (code !== 'auth/user-not-found') {
-        throw err;
-      }
-    }
+    const secretRef = db.collection('staffPinSecrets').doc(staffId);
+    const secretSnap = await secretRef.get();
 
     if (dryRun) {
       console.log(
-        `[DRY RUN] ${staffId} (${fullName}) -> ${authEmail} | authExists=${Boolean(existingAuthUser)} | isActive=${isActive}`
+        `[DRY RUN] ${staffId} (${fullName}) -> uid=${uid} | secretExists=${secretSnap.exists} | isActive=${isActive}`
       );
       continue;
     }
 
-    let uid: string;
-    let tempPassword = '';
+    let assignedPin = '';
     let statusLabel = '';
+    let shouldWriteSecret = false;
 
-    if (!existingAuthUser) {
-      tempPassword = generateTemporaryPassword(12);
-      const userRecord = await auth.createUser({
-        email: authEmail,
-        emailVerified: true,
-        password: tempPassword,
-        displayName: `${staffId} - ${fullName}`.slice(0, 120),
-        disabled: !isActive,
-      });
-      uid = userRecord.uid;
-      createdAuthCount += 1;
-      statusLabel = 'CREATED_AUTH_ACCOUNT';
+    if (!secretSnap.exists) {
+      assignedPin = randomPins ? generateRandomPin(6) : uniformInitialPin;
+      shouldWriteSecret = true;
+      createdSecretCount += 1;
+      statusLabel = 'INITIALIZED_PIN_SECRET';
+    } else if (resetAllPins) {
+      assignedPin = randomPins ? generateRandomPin(6) : uniformInitialPin;
+      shouldWriteSecret = true;
+      resetSecretCount += 1;
+      statusLabel = 'RESET_PIN_SECRET';
     } else {
-      uid = existingAuthUser.uid;
-      linkedExistingCount += 1;
-      if (resetAllPasswords) {
-        tempPassword = generateTemporaryPassword(12);
-        await auth.updateUser(uid, {
-          password: tempPassword,
-          emailVerified: true,
-          displayName: `${staffId} - ${fullName}`.slice(0, 120),
-          disabled: !isActive,
-        });
-        updatedPasswordCount += 1;
-        statusLabel = 'LINKED_AND_PASSWORD_RESET';
-      } else {
-        await auth.updateUser(uid, {
-          emailVerified: true,
-          displayName: `${staffId} - ${fullName}`.slice(0, 120),
-          disabled: !isActive,
-        });
-        statusLabel = 'LINKED_EXISTING_AUTH';
-      }
+      preservedSecretCount += 1;
+      statusLabel = 'PRESERVED_EXISTING_PIN';
     }
 
     const batch = db.batch();
+
+    if (shouldWriteSecret) {
+      const { pinSalt, pinHash, hashAlgo } = hashPinPbkdf2Node(assignedPin);
+      batch.set(secretRef, {
+        staffId,
+        authUid: uid,
+        pinSalt,
+        pinHash,
+        hashAlgo,
+        mustChangePin: true,
+        failedAttempts: 0,
+        lockedUntilMs: 0,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
+
+    const nextMustChange = shouldWriteSecret
+      ? true
+      : Boolean(secretSnap.data()?.mustChangePin ?? data.mustChangePassword);
+
     const staffUpdate: Record<string, unknown> = {
       authUid: uid,
-      authEmail,
-      mustChangePassword: tempPassword ? true : Boolean(data.mustChangePassword),
+      mustChangePassword: nextMustChange,
       updatedAt: FieldValue.serverTimestamp(),
     };
+    if (!('createdAt' in data)) {
+      staffUpdate.createdAt = FieldValue.serverTimestamp();
+    }
     if (stripLegacyHashes && 'passwordHash' in data) {
       staffUpdate.passwordHash = FieldValue.delete();
     }
@@ -175,32 +214,32 @@ async function main() {
 
     await batch.commit();
 
-    if (tempPassword) {
-      credentialsOut.push({
+    if (randomPins && assignedPin) {
+      randomOut.push({
         staffId,
         fullName,
         designation,
         role,
         authUid: uid,
-        authEmail,
-        temporaryPassword: tempPassword,
+        temporaryPin: assignedPin,
         status: statusLabel,
       });
     }
   }
 
   if (dryRun) {
-    console.log('\nDry run finished. No Firebase Auth users or Firestore documents modified.');
+    console.log('\nDry run finished. No Firestore documents modified.');
     return;
   }
 
-  console.log('\nMigration summary:');
-  console.log(`- Total staff records processed: ${staffDocs.length}`);
-  console.log(`- New Firebase Auth accounts created: ${createdAuthCount}`);
-  console.log(`- Existing Firebase Auth accounts linked: ${linkedExistingCount}`);
-  console.log(`- Existing accounts with password reset: ${updatedPasswordCount}`);
+  console.log('\nProvisioning summary:');
+  console.log(`- Total existing staff records processed: ${staffDocs.length}`);
+  console.log(`- New server-side PBKDF2 PIN secrets created: ${createdSecretCount}`);
+  console.log(`- Existing PIN secrets preserved untouched: ${preservedSecretCount}`);
+  console.log(`- Existing PIN secrets reset (--reset-all-pins): ${resetSecretCount}`);
+  console.log('- Existing staff profile details and leave requests were left untouched.');
 
-  if (credentialsOut.length > 0) {
+  if (randomOut.length > 0) {
     const csvPath = path.resolve(
       process.cwd(),
       `.local-initial-credentials-${stamp}.csv`
@@ -211,22 +250,20 @@ async function main() {
       'Designation',
       'Role',
       'Firebase UID',
-      'Internal Auth Email (Do Not Display on Login)',
-      'One-Time Temporary Password',
+      'One-Time Temporary PIN',
       'Status',
     ]
       .map(escapeCsvCell)
       .join(',');
 
-    const lines = credentialsOut.map((row) =>
+    const lines = randomOut.map((row) =>
       [
         row.staffId,
         row.fullName,
         row.designation,
         row.role,
         row.authUid,
-        row.authEmail,
-        row.temporaryPassword,
+        row.temporaryPin,
         row.status,
       ]
         .map(escapeCsvCell)
@@ -235,12 +272,8 @@ async function main() {
 
     writeRestrictedFile(csvPath, [header, ...lines].join('\n') + '\n');
     console.log(
-      `\nWrote ${credentialsOut.length} one-time initial password(s) to ${csvPath} (chmod 600).`
+      `\nWrote ${randomOut.length} one-time random PIN(s) to ${csvPath} (chmod 600). Delete after distribution.`
     );
-    console.log(
-      'Distribute each temporary password securely to the employee; they will be required to change it on first login.'
-    );
-    console.log('Delete the local CSV file after distribution.');
   }
 }
 

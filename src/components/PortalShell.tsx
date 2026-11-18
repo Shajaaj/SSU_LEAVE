@@ -260,10 +260,10 @@ export const PortalShell: React.FC<PortalShellProps> = ({
               type="button"
               onClick={onOpenChangePassword}
               className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-slate-300 hover:text-white bg-white/5 hover:bg-white/10 transition-colors whitespace-nowrap"
-              title="Change Password"
+              title="Change PIN"
             >
               <KeyRound className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-              {!sidebarCollapsed && <span>Change Password</span>}
+              {!sidebarCollapsed && <span>Change PIN</span>}
             </button>
           )}
 
@@ -508,7 +508,7 @@ export const PortalShell: React.FC<PortalShellProps> = ({
                   className="w-full min-h-[48px] px-3.5 rounded-xl flex items-center gap-3 text-sm font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                 >
                   <KeyRound className="w-4 h-4 shrink-0" aria-hidden="true" />
-                  <span>Change Password</span>
+                  <span>Change PIN</span>
                 </button>
               )}
               <button

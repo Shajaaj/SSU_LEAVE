@@ -14,12 +14,18 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID || appletConfig.appId,
 };
 
+const rawDatabaseId =
+  import.meta.env.VITE_FIREBASE_DATABASE_ID || appletConfig.firestoreDatabaseId || '';
 const firestoreDatabaseId =
-  import.meta.env.VITE_FIREBASE_DATABASE_ID || appletConfig.firestoreDatabaseId;
+  rawDatabaseId.trim() && rawDatabaseId.trim() !== '(default)'
+    ? rawDatabaseId.trim()
+    : undefined;
 
 export const firebaseApp = initializeApp(firebaseConfig);
 export const auth = getAuth(firebaseApp);
-export const db = getFirestore(firebaseApp, firestoreDatabaseId);
+export const db = firestoreDatabaseId
+  ? getFirestore(firebaseApp, firestoreDatabaseId)
+  : getFirestore(firebaseApp);
 
 export enum OperationType {
   CREATE = 'create',

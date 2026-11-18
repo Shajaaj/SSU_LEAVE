@@ -134,10 +134,10 @@ export const ADVERSARIAL_RULE_PAYLOADS: AdversarialRuleTestCase[] = [
   },
   {
     id: 10,
-    name: 'Unverified Firebase Auth token attempting settings write',
+    name: 'Signed-in token without active staffAuthLinks entry attempting settings write',
     collection: 'appSettings/portalConfig',
     operation: 'update',
-    actor: { uid: 'spoof_uid', role: 'unverified', emailVerified: false },
+    actor: { uid: 'spoof_unlinked_uid', role: 'unverified', emailVerified: false },
     payload: { maxDailyCombinedCap: 10 },
     expectedResult: 'PERMISSION_DENIED',
   },
@@ -166,6 +166,14 @@ export const ADVERSARIAL_RULE_PAYLOADS: AdversarialRuleTestCase[] = [
       isActive: true,
       passwordHash: 'should_never_be_stored',
     },
+    expectedResult: 'PERMISSION_DENIED',
+  },
+  {
+    id: 13,
+    name: 'Manager attempting to read or tamper with server-only staffPinSecrets via client SDK',
+    collection: 'staffPinSecrets/A-5530',
+    operation: 'get',
+    actor: { uid: 'manager_uid', role: 'manager', emailVerified: true },
     expectedResult: 'PERMISSION_DENIED',
   },
 ];

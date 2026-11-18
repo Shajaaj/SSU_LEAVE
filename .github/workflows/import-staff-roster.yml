@@ -1,0 +1,106 @@
+name: Import Staff Roster (PIN Auth)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution mode: validate (read-only, no credentials) or import (writes missing staff records to Firestore)'
+        required: true
+        type: choice
+        default: validate
+        options:
+          - validate
+          - import
+      roster_path:
+        description: 'Path to CSV staff roster in repository'
+        required: true
+        type: string
+        default: 'data/ssleave_staff_roster.csv'
+      confirm_import:
+        description: 'Type IMPORT to confirm writing new staff records to ss-leave-management (required only when mode is import)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Staff Roster CSV (Read-Only)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Verify roster file exists
+        env:
+          ROSTER_PATH: ${{ inputs.roster_path }}
+        run: |
+          if [ ! -f "$ROSTER_PATH" ]; then
+            echo "::error::Roster file not found at $ROSTER_PATH"
+            exit 1
+          fi
+
+      - name: Validate CSV rows & Staff ID collisions (offline, no secrets)
+        env:
+          ROSTER_PATH: ${{ inputs.roster_path }}
+        run: npx tsx scripts/adminStaffAuth.ts import "$ROSTER_PATH" --validate-only
+
+  import:
+    name: Idempotent Staff Roster Import (ss-leave-management)
+    needs: validate
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'import' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify manual confirmation input
+        env:
+          CONFIRM_INPUT: ${{ inputs.confirm_import }}
+        run: |
+          if [ "$CONFIRM_INPUT" != "IMPORT" ]; then
+            echo "::error::Confirmation failed. To run import mode, set confirm_import to IMPORT."
+            exit 1
+          fi
+
+      - name: Verify Firebase service account secret is configured
+        env:
+          HAS_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY != '' }}
+        run: |
+          if [ "$HAS_SA_KEY" != "true" ]; then
+            echo "::error::Missing repository secret FIREBASE_SERVICE_ACCOUNT_KEY."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Import new staff & PBKDF2 PIN secrets (idempotent, masked, no artifacts)
+        env:
+          ROSTER_PATH: ${{ inputs.roster_path }}
+          FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+          INITIAL_STAFF_PIN: '1234'
+        run: |
+          echo "::add-mask::$INITIAL_STAFF_PIN"
+          npx tsx scripts/adminStaffAuth.ts import "$ROSTER_PATH"

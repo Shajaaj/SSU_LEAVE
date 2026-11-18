@@ -1,12 +1,9 @@
 {
-  "projectId": "gen-lang-client-0180778148",
-  "appId": "1:592983544160:web:616180b5f18e164fb50e05",
-  "apiKey": "AIzaSyBGzcRxRnjWZnMX94xcRHEFLLWgjN7lRaQ",
-  "authDomain": "gen-lang-client-0180778148.firebaseapp.com",
-  "firestoreDatabaseId": "ai-studio-ee2eb30d-6479-40ee-8c90-a5e78ecc9769",
-  "storageBucket": "gen-lang-client-0180778148.firebasestorage.app",
-  "messagingSenderId": "592983544160",
-  "measurementId": "",
-  "oAuthClientId": "592983544160-h1e5mfsrnqnvv9n2mgqns63qjhri4e6m.apps.googleusercontent.com",
-  "recaptchaSiteKey": ""
+  "projectId": "ss-leave-management",
+  "appId": "1:402233313052:web:e2292023ebefa21be11cd9",
+  "apiKey": "AIzaSyDb-47njsNmqWRmIYbwpi_HGlqLQ-_t1Pk",
+  "authDomain": "ss-leave-management.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "ss-leave-management.firebasestorage.app",
+  "messagingSenderId": "402233313052"
 }

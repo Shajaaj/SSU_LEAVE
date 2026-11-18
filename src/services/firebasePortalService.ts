@@ -1,12 +1,9 @@
 import {
-  EmailAuthProvider,
   browserLocalPersistence,
   browserSessionPersistence,
-  reauthenticateWithCredential,
   setPersistence,
-  signInWithEmailAndPassword,
+  signInWithCustomToken,
   signOut,
-  updatePassword,
 } from 'firebase/auth';
 import {
   Unsubscribe,
@@ -37,7 +34,7 @@ import {
   UserRole,
 } from '../types/portal';
 import { expandDateRange, getMonthMetadata } from '../utils/maldivesDate';
-import { staffIdToAuthEmail } from '../utils/staffAuthId';
+import { isValidPinFormat, isValidStaffIdFormat } from '../utils/staffAuthId';
 
 const REMEMBERED_STAFF_ID_KEY = 'ssu_remembered_staff_id';
 
@@ -106,6 +103,41 @@ function normalizeStaffProfile(raw: Record<string, unknown>, id: string): StaffP
   };
 }
 
+async function postWorkerJson<T>(
+  path: string,
+  payload: Record<string, unknown>,
+  bearerToken?: string
+): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    throw new Error(
+      'Unable to reach the authentication server. Check your internet connection and try again.'
+    );
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    throw new Error(
+      'PIN authentication Worker endpoint (/api/*) is unavailable. Deploy or run with Cloudflare Workers.'
+    );
+  }
+
+  const data = (await response.json()) as T & { error?: string };
+  if (!response.ok) {
+    throw new Error(data?.error || `Request failed (${response.status}).`);
+  }
+  return data;
+}
+
 export async function resolveSignedInStaffProfile(
   uid: string
 ): Promise<StaffProfile> {
@@ -156,10 +188,23 @@ export async function resolveSignedInStaffProfile(
 
 export async function loginWithStaffId(
   staffId: string,
-  password: string,
+  pin: string,
   rememberOnDevice = true
 ): Promise<{ user: StaffProfile }> {
-  const email = staffIdToAuthEmail(staffId);
+  const trimmedStaffId = staffId.trim();
+  const trimmedPin = pin.trim();
+  if (!isValidStaffIdFormat(trimmedStaffId) || !isValidPinFormat(trimmedPin)) {
+    throw new Error('Invalid Staff ID or PIN.');
+  }
+
+  const authResponse = await postWorkerJson<{
+    customToken: string;
+    staffId: string;
+    mustChangePin?: boolean;
+  }>('/api/auth/login', {
+    staffId: trimmedStaffId,
+    pin: trimmedPin,
+  });
 
   try {
     await setPersistence(
@@ -172,25 +217,25 @@ export async function loginWithStaffId(
 
   let credential;
   try {
-    credential = await signInWithEmailAndPassword(auth, email, password);
+    credential = await signInWithCustomToken(auth, authResponse.customToken);
   } catch (err: unknown) {
     const code = (err as { code?: string })?.code || '';
-    if (code === 'auth/too-many-requests') {
-      throw new Error(
-        'Too many failed login attempts. Please wait a few minutes and try again.'
-      );
-    }
     if (code === 'auth/user-disabled') {
       throw new Error('This account has been deactivated. Contact a Manager.');
     }
     if (code === 'auth/network-request-failed') {
       throw new Error('Network error while connecting to Firebase Authentication.');
     }
-    throw new Error('Invalid Staff ID or password.');
+    throw new Error(
+      err instanceof Error ? err.message : 'Unable to establish authenticated session.'
+    );
   }
 
   try {
     const profile = await resolveSignedInStaffProfile(credential.user.uid);
+    if (typeof authResponse.mustChangePin === 'boolean') {
+      profile.mustChangePassword = authResponse.mustChangePin;
+    }
     setRememberedStaffId(rememberOnDevice ? profile.staffId : null);
     return { user: profile };
   } catch (err) {
@@ -204,70 +249,59 @@ export async function logoutSession(): Promise<void> {
 }
 
 export async function changeOwnPassword(
-  staff: StaffProfile,
-  currentPassword: string,
-  newPassword: string
+  _staff: StaffProfile,
+  currentPin: string,
+  newPin: string
 ): Promise<void> {
   const user = auth.currentUser;
-  if (!user || !user.email) {
+  if (!user) {
     throw new Error('Authentication required. Please sign in again.');
   }
 
-  const trimmedNew = newPassword.trim();
-  if (trimmedNew.length < 8) {
-    throw new Error('New password must be at least 8 characters long.');
+  const trimmedCurrent = currentPin.trim();
+  const trimmedNew = newPin.trim();
+  if (!isValidPinFormat(trimmedCurrent)) {
+    throw new Error('Current PIN must be 4 to 12 numeric digits.');
   }
-  if (trimmedNew === currentPassword) {
-    throw new Error('New password must be different from your current password.');
+  if (!isValidPinFormat(trimmedNew)) {
+    throw new Error('New PIN must be 4 to 12 numeric digits.');
   }
-
-  try {
-    const cred = EmailAuthProvider.credential(user.email, currentPassword);
-    await reauthenticateWithCredential(user, cred);
-    await updatePassword(user, trimmedNew);
-  } catch (err: unknown) {
-    const code = (err as { code?: string })?.code || '';
-    if (code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
-      throw new Error('Current password is incorrect.');
-    }
-    if (code === 'auth/weak-password') {
-      throw new Error('Choose a stronger password (at least 8 characters).');
-    }
-    if (code === 'auth/requires-recent-login') {
-      throw new Error('Please sign out and log back in before changing your password.');
-    }
-    throw new Error(err instanceof Error ? err.message : 'Unable to update password.');
+  if (trimmedNew === trimmedCurrent) {
+    throw new Error('New PIN must be different from your current PIN.');
   }
 
-  const logId = makeClientId('log');
-  const batch = writeBatch(db);
-  if (staff.mustChangePassword) {
-    batch.update(doc(db, 'staff', staff.staffId), {
-      mustChangePassword: false,
-      updatedAt: serverTimestamp(),
-    });
-  }
-  batch.set(doc(db, 'auditLogs', logId), {
-    logId,
-    action: 'PASSWORD_UPDATED',
-    targetType: 'staff',
-    targetId: staff.staffId,
-    actorStaffId: staff.staffId,
-    actorName: staff.fullName,
-    actorRole: staff.role,
-    summary: `${staff.staffId} (${staff.fullName}) updated their account password.`,
-    createdAt: serverTimestamp(),
-  });
+  const idToken = await user.getIdToken(true);
+  await postWorkerJson<{ ok: boolean }>(
+    '/api/auth/change-pin',
+    {
+      currentPin: trimmedCurrent,
+      newPin: trimmedNew,
+    },
+    idToken
+  );
+}
 
-  try {
-    await batch.commit();
-  } catch (err) {
-    handleFirestoreError(
-      err,
-      OperationType.WRITE,
-      staff.mustChangePassword ? `staff/${staff.staffId}` : `auditLogs/${logId}`
-    );
+export async function resetStaffPinByManager(
+  targetStaffId: string,
+  tempPin: string
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please sign in again.');
   }
+  const trimmedPin = tempPin.trim();
+  if (!isValidPinFormat(trimmedPin)) {
+    throw new Error('Temporary PIN must be 4 to 12 numeric digits.');
+  }
+  const idToken = await user.getIdToken(true);
+  await postWorkerJson<{ ok: boolean; staffId: string }>(
+    '/api/admin/reset-pin',
+    {
+      targetStaffId: targetStaffId.trim(),
+      tempPin: trimmedPin,
+    },
+    idToken
+  );
 }
 
 /* -------------------------------------------------------------------------- */

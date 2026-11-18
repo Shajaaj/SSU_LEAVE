@@ -11,7 +11,10 @@ import {
   loginWithStaffId,
 } from '../services/firebasePortalService';
 import { StaffProfile } from '../types/portal';
-import { isValidStaffIdFormat } from '../utils/staffAuthId';
+import {
+  isValidPinFormat,
+  isValidStaffIdFormat,
+} from '../utils/staffAuthId';
 
 interface LoginScreenProps {
   darkMode: boolean;
@@ -41,21 +44,22 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     setError(null);
 
     const trimmedId = staffId.trim();
+    const trimmedPin = password.trim();
     if (!isValidStaffIdFormat(trimmedId)) {
       setError('Enter a valid Staff ID (e.g. A-5530 or A10002).');
       return;
     }
-    if (!password) {
-      setError('Please enter your assigned password.');
+    if (!isValidPinFormat(trimmedPin)) {
+      setError('Enter your 4 to 12 digit numeric PIN.');
       return;
     }
 
     setSubmitting(true);
     try {
-      const { user } = await loginWithStaffId(trimmedId, password, rememberMe);
+      const { user } = await loginWithStaffId(trimmedId, trimmedPin, rememberMe);
       onLoginSuccess(user);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Invalid Staff ID or password.');
+      setError(err instanceof Error ? err.message : 'Invalid Staff ID or PIN.');
     } finally {
       setSubmitting(false);
     }
@@ -160,13 +164,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
             <div className="relative">
               <label htmlFor="login-password" className="sr-only">
-                Password
+                PIN
               </label>
               <input
                 id="login-password"
                 type={showPassword ? 'text' : 'password'}
+                inputMode="numeric"
                 autoComplete="current-password"
-                placeholder="Password"
+                placeholder="PIN"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="w-full h-11 pl-3.5 pr-11 rounded-[3px] border-[1.5px] border-[#0B1F3A] dark:border-teal-500/80 bg-white dark:bg-[#0D1B2A] text-base sm:text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
@@ -176,7 +181,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                 type="button"
                 onClick={() => setShowPassword((v) => !v)}
                 className="absolute right-0 top-0 h-11 w-11 flex items-center justify-center text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200"
-                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                aria-label={showPassword ? 'Hide PIN' : 'Show PIN'}
               >
                 {showPassword ? (
                   <EyeOff className="w-4 h-4" />

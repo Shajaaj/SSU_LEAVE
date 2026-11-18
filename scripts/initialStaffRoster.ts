@@ -14,13 +14,43 @@ export interface InitialStaffSeedRow {
   role?: ServerRole;
 }
 
+export const AUTHORIZED_MANAGER_STAFF_IDS = new Set<string>(['a5530']);
+export const AUTHORIZED_EXECUTIVE_STAFF_IDS = new Set<string>(['a4107']);
+
+export function resolveAuthorizedRole(
+  staffId: string,
+  designation: ServerDesignation,
+  requestedRole?: string
+): ServerRole {
+  const token = staffId.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (AUTHORIZED_MANAGER_STAFF_IDS.has(token)) {
+    return 'manager';
+  }
+  if (AUTHORIZED_EXECUTIVE_STAFF_IDS.has(token)) {
+    return 'executive';
+  }
+  if (requestedRole) {
+    const normalizedRole = requestedRole.trim().toLowerCase();
+    if (normalizedRole === 'manager') {
+      throw new Error(
+        `Role escalation rejected for "${staffId}": Manager permissions can only be assigned through the authorized role mapping.`
+      );
+    }
+    if (normalizedRole === 'executive') return 'executive';
+    if (normalizedRole === 'staff') return 'staff';
+    throw new Error(
+      `Unsupported role "${requestedRole}" for "${staffId}". Allowed CSV roles: staff, executive.`
+    );
+  }
+  if (designation === 'EXECUTIVE') return 'executive';
+  return 'staff';
+}
+
 export function deriveDefaultRole(
   staffId: string,
   designation: ServerDesignation
 ): ServerRole {
-  if (staffId === 'A-5530' || designation === 'MANAGER') return 'manager';
-  if (designation === 'EXECUTIVE') return 'executive';
-  return 'staff';
+  return resolveAuthorizedRole(staffId, designation);
 }
 
 export function doesDesignationCountTowardDailyCap(

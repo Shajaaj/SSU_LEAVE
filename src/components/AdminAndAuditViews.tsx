@@ -39,6 +39,7 @@ interface AdministrationViewProps {
     }
   ) => Promise<void>;
   onRemoveStaff: (target: StaffProfile) => Promise<void>;
+  onResetStaffPin?: (target: StaffProfile, tempPin: string) => Promise<void>;
   onUpdateSettings: (next: {
     maxDailyCombinedCap: number;
     maxAnnualLeavePeriods: number;
@@ -51,6 +52,7 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
   settings,
   onUpdateStaff,
   onRemoveStaff,
+  onResetStaffPin,
   onUpdateSettings,
 }) => {
   // Edit Staff Modal
@@ -64,8 +66,11 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
   const [editLimit, setEditLimit] = useState(3);
   const [savingEdit, setSavingEdit] = useState(false);
 
-  // Admin Password Reset CLI Modal
+  // Admin PIN Reset Modal
   const [resetTarget, setResetTarget] = useState<StaffProfile | null>(null);
+  const [resetTempPin, setResetTempPin] = useState('');
+  const [resettingPin, setResettingPin] = useState(false);
+  const [resetPinError, setResetPinError] = useState<string | null>(null);
 
   // Remove Staff Confirmation Modal
   const [removeTarget, setRemoveTarget] = useState<StaffProfile | null>(null);
@@ -129,10 +134,10 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
           <div>
             <h2 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white flex items-center gap-2">
               <Terminal className="w-4 h-4 text-teal-600 dark:text-teal-400" aria-hidden="true" />
-              <span>Trusted Admin CLI — Provisioning, Bulk Import & Password Resets</span>
+              <span>Trusted Admin CLI — Provisioning, Bulk Import &amp; PIN Resets</span>
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
-              Because this portal runs as a static SPA on Firebase Hosting (Spark Free Tier) with zero browser-exposed service account keys, creating Firebase Authentication users, importing rosters, and resetting another employee&apos;s password are executed from a trusted administrator workstation.
+              Service account credentials stay exclusively in encrypted Cloudflare Worker secrets and trusted administrator CLI environments. Creating new staff records, bulk importing rosters, or cleaning up removed auth credentials is executed from an administrator workstation, while PIN resets can be issued either directly below or via CLI.
             </p>
           </div>
         </div>
@@ -158,10 +163,10 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
 
           <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-1.5">
             <p className="font-semibold text-[#0B1F3A] dark:text-teal-300">
-              3. Admin Password Reset
+              3. Admin PIN Reset
             </p>
             <code className="block font-mono text-[11px] bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded p-2 overflow-x-auto text-slate-800 dark:text-slate-200">
-              npx tsx scripts/adminStaffAuth.ts reset-password A-7111
+              npx tsx scripts/adminStaffAuth.ts reset-pin A-7111
             </code>
           </div>
         </div>
@@ -206,11 +211,15 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setResetTarget(p)}
+                  onClick={() => {
+                    setResetTarget(p);
+                    setResetTempPin('');
+                    setResetPinError(null);
+                  }}
                   className="flex-1 min-w-[120px] min-h-[44px] px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold inline-flex items-center justify-center gap-1.5"
                 >
                   <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />
-                  <span>Reset Password</span>
+                  <span>Reset PIN</span>
                 </button>
                 <button
                   type="button"
@@ -269,11 +278,15 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
                     </button>
                     <button
                       type="button"
-                      onClick={() => setResetTarget(p)}
+                      onClick={() => {
+                        setResetTarget(p);
+                        setResetTempPin('');
+                        setResetPinError(null);
+                      }}
                       className="px-2.5 py-1.5 rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold inline-flex items-center gap-1"
                     >
                       <KeyRound className="w-3 h-3" aria-hidden="true" />
-                      <span>Reset Password</span>
+                      <span>Reset PIN</span>
                     </button>
                     <button
                       type="button"
@@ -453,33 +466,91 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
         </div>
       )}
 
-      {/* Trusted Admin CLI Password Reset Modal */}
+      {/* Manager PIN Reset Modal (Cloudflare Worker + CLI Fallback) */}
       {resetTarget && (
         <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
           <div className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-t-2xl sm:rounded-xl max-w-lg w-full p-5 sm:p-6 space-y-4 shadow-xl max-h-[92vh] overflow-y-auto">
             <div className="flex items-center gap-2 text-teal-700 dark:text-teal-400">
               <KeyRound className="w-4 h-4 shrink-0" aria-hidden="true" />
               <h3 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white">
-                Reset Password: {resetTarget.fullName} ({resetTarget.staffId})
+                Reset PIN: {resetTarget.fullName} ({resetTarget.staffId})
               </h3>
             </div>
             <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-              Firebase Authentication does not allow a browser client to reset another employee&apos;s password without Admin SDK privileges. Run the trusted Administrator CLI from an authorized workstation to assign a new one-time temporary password and flag <code className="font-mono">mustChangePassword = true</code>:
+              Assign a temporary numeric PIN (4 to 12 digits). The PIN is hashed server-side on our Cloudflare Worker using PBKDF2-SHA256, and the employee will be required to choose a personal PIN upon next login.
             </p>
-            <code className="block font-mono text-xs bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 rounded-lg p-3 overflow-x-auto text-slate-900 dark:text-slate-100">
-              npx tsx scripts/adminStaffAuth.ts reset-password {resetTarget.staffId}
-            </code>
-            <p className="text-[11px] text-slate-500 dark:text-slate-400">
-              To specify a custom temporary password (minimum 8 characters), append <code className="font-mono">--password &quot;TempPass123!&quot;</code>. Plaintext passwords are never stored in Firestore.
-            </p>
-            <div className="flex justify-end pt-1">
-              <button
-                type="button"
-                onClick={() => setResetTarget(null)}
-                className="min-h-[44px] sm:min-h-0 px-4 py-2 text-xs font-semibold rounded-lg bg-[#0B1F3A] dark:bg-teal-600 text-white"
+
+            {onResetStaffPin && (
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setResetPinError(null);
+                  const cleaned = resetTempPin.trim();
+                  if (!/^\d{4,12}$/.test(cleaned)) {
+                    setResetPinError('Temporary PIN must be 4 to 12 numeric digits.');
+                    return;
+                  }
+                  setResettingPin(true);
+                  try {
+                    await onResetStaffPin(resetTarget, cleaned);
+                    setResetTarget(null);
+                    setResetTempPin('');
+                  } catch (err) {
+                    setResetPinError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setResettingPin(false);
+                  }
+                }}
+                className="space-y-3"
               >
-                Close
-              </button>
+                <div>
+                  <label htmlFor="admin-reset-pin" className="block text-xs font-semibold mb-1">
+                    New Temporary Numeric PIN (4 to 12 digits)
+                  </label>
+                  <input
+                    id="admin-reset-pin"
+                    type="password"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    minLength={4}
+                    maxLength={12}
+                    value={resetTempPin}
+                    onChange={(e) => setResetTempPin(e.target.value.replace(/\D/g, ''))}
+                    placeholder="Enter temporary numeric PIN"
+                    className="w-full min-h-[42px] sm:min-h-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-xs font-mono tracking-widest"
+                    required
+                  />
+                </div>
+                {resetPinError && (
+                  <p className="text-xs text-red-700 dark:text-red-300">{resetPinError}</p>
+                )}
+                <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+                  <button
+                    type="button"
+                    disabled={resettingPin}
+                    onClick={() => setResetTarget(null)}
+                    className="w-full sm:w-auto min-h-[44px] sm:min-h-0 px-4 py-2 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={resettingPin}
+                    className="w-full sm:w-auto min-h-[44px] sm:min-h-0 px-4 py-2 text-xs font-semibold rounded-lg bg-teal-600 hover:bg-teal-700 text-white disabled:opacity-60"
+                  >
+                    {resettingPin ? 'Resetting PIN...' : 'Set Temporary PIN'}
+                  </button>
+                </div>
+              </form>
+            )}
+
+            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1.5">
+              <p className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+                Or via trusted Admin CLI:
+              </p>
+              <code className="block font-mono text-[11px] bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 rounded-lg p-2.5 overflow-x-auto text-slate-900 dark:text-slate-100">
+                npx tsx scripts/adminStaffAuth.ts reset-pin {resetTarget.staffId} --pin &lt;tempPin&gt;
+              </code>
             </div>
           </div>
         </div>
@@ -682,35 +753,35 @@ export const DeploymentSecurityView: React.FC = () => {
         <div className="flex items-center gap-2">
           <ShieldCheck className="w-4 h-4 text-teal-600 dark:text-teal-400" aria-hidden="true" />
           <h2 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white">
-            Firebase Hosting (Spark Tier) — Authentication & Firestore Security Architecture
+            Cloudflare Workers &amp; Firebase — Authentication &amp; Firestore Security Architecture
           </h2>
         </div>
         <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-          This portal runs directly as a static SPA on <strong>Firebase Hosting</strong> connected to Firebase project <code className="font-mono">gen-lang-client-0180778148</code> (Firestore database <code className="font-mono">ai-studio-ee2eb30d-6479-40ee-8c90-a5e78ecc9769</code>) using real-time <code className="font-mono">onSnapshot</code> synchronization with zero continuous Node.js server dependency.
+          This portal runs on <strong>Cloudflare Workers</strong> (static SPA + Edge API endpoints) connected to Firebase project <code className="font-mono">ss-leave-management</code> (Cloud Firestore <code className="font-mono">(default)</code> database) using real-time <code className="font-mono">onSnapshot</code> synchronization and Firebase Authentication Custom Tokens.
         </p>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
           <div className="p-4 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-2">
             <h3 className="font-semibold text-emerald-700 dark:text-emerald-400">
-              Authentication & Access Control
+              Server-Verified PIN &amp; Custom Token Auth
             </h3>
             <ul className="list-disc pl-4 space-y-1.5 text-slate-600 dark:text-slate-300">
-              <li>Employees enter only their <strong>Staff ID</strong> and <strong>Password</strong>; the client deterministically maps Staff IDs (e.g. <code className="font-mono">A-5530</code> → <code className="font-mono">a5530@staff.example.com</code>) for Firebase Email/Password authentication.</li>
-              <li>UID-to-Staff-ID and role bindings live in <code className="font-mono">staffAuthLinks/&#123;uid&#125;</code> and are verified by <code className="font-mono">firestore.rules</code> on every read and write.</li>
-              <li>Regular staff can read only their own <code className="font-mono">staff</code> and <code className="font-mono">leaveRequests</code> documents, while viewing non-PII daily availability via <code className="font-mono">dailyCapacity</code> and <code className="font-mono">dailyCapacityDetails</code>.</li>
-              <li>All <code className="font-mono">auditLogs</code> are strictly append-only (<code className="font-mono">allow update, delete: if false</code>) and readable only by Managers.</li>
+              <li>Employees enter only their <strong>Staff ID</strong> and <strong>numeric PIN</strong>. No email address is collected or exposed.</li>
+              <li>The Cloudflare Worker (<code className="font-mono">/api/auth/login</code>) verifies the Staff ID against existing <code className="font-mono">staff</code> records, checks PBKDF2-SHA256 salted PIN hashes in <code className="font-mono">staffPinSecrets</code> (inaccessible to browser clients), enforces IP rate limiting and 5-attempt lockout, and mints a short-lived Firebase Custom Token.</li>
+              <li>PIN changes (<code className="font-mono">/api/auth/change-pin</code>) verify the user&apos;s Firebase ID Token, save the new PBKDF2 hash centrally in Firestore, clear <code className="font-mono">mustChangePassword</code>, and sync across all devices.</li>
+              <li>All <code className="font-mono">auditLogs</code> are strictly append-only and readable only by Managers.</li>
             </ul>
           </div>
 
           <div className="p-4 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-2">
             <h3 className="font-semibold text-teal-700 dark:text-teal-400">
-              Real-Time Sync & Atomic Transactions
+              Real-Time Sync &amp; Atomic Transactions
             </h3>
             <ul className="list-disc pl-4 space-y-1.5 text-slate-600 dark:text-slate-300">
               <li>Leave submissions, Executive approvals/rejections, and calendar capacity updates synchronize live across all connected devices via Firestore <code className="font-mono">onSnapshot</code>.</li>
               <li>Concurrent approvals execute inside Firestore <code className="font-mono">runTransaction()</code> across <code className="font-mono">leaveRequests</code>, <code className="font-mono">dailyCapacity</code>, <code className="font-mono">dailyCapacityDetails</code>, and <code className="font-mono">auditLogs</code>.</li>
               <li>Security rules enforce <code className="font-mono">approvedCount &gt;= 0 &amp;&amp; approvedCount &lt;= maxCapacity &amp;&amp; maxCapacity &lt;= 10</code> on every date document.</li>
-              <li>Trusted local Admin CLI scripts (<code className="font-mono">scripts/migrateToFirebaseAuth.ts</code>, <code className="font-mono">scripts/adminStaffAuth.ts</code>) handle user creation and password resets without exposing service-account keys in the browser.</li>
+              <li>Firebase Admin credentials live exclusively inside encrypted Cloudflare Worker secrets (<code className="font-mono">FIREBASE_SERVICE_ACCOUNT_KEY</code>) and are never included in frontend bundles or GitHub.</li>
             </ul>
           </div>
         </div>
@@ -718,14 +789,14 @@ export const DeploymentSecurityView: React.FC = () => {
         <div className="p-4 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 text-xs text-amber-950 dark:text-amber-200 space-y-1.5">
           <p className="font-semibold flex items-center gap-1.5">
             <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
-            <span>Explicit Spark Free-Tier Security Limitations</span>
+            <span>Operational Security Notes</span>
           </p>
           <ul className="list-disc pl-4 space-y-1 text-amber-900 dark:text-amber-200/90">
             <li>
-              <strong>Multi-document rule boundary:</strong> Firestore Security Rules cannot loop over dynamic <code className="font-mono">dates[]</code> arrays (1–30 days) or count annual leave periods across collections in a single rule evaluation. Client-side <code className="font-mono">runTransaction()</code> enforces concurrency and rules cap each date document at <code className="font-mono">approvedCount &lt;= 10</code>, but full server-side enforcement against a compromised Executive client requires upgrading to the Blaze plan with Cloud Functions.
+              <strong>Multi-document rule boundary:</strong> Firestore Security Rules cannot loop over dynamic <code className="font-mono">dates[]</code> arrays (1–30 days) or count annual leave periods across collections in a single rule evaluation. Client-side <code className="font-mono">runTransaction()</code> enforces concurrency and rules cap each date document at <code className="font-mono">approvedCount &lt;= 10</code>.
             </li>
             <li>
-              <strong>Firebase Auth lifecycle:</strong> Deleting or creating Firebase Auth users and resetting another user&apos;s password require the Admin CLI (<code className="font-mono">scripts/adminStaffAuth.ts</code>) because Cloud Functions are not used on Spark.
+              <strong>Secret management:</strong> Always keep <code className="font-mono">FIREBASE_SERVICE_ACCOUNT_KEY</code> stored solely via <code className="font-mono">wrangler secret put</code> and local untracked <code className="font-mono">.env</code> files.
             </li>
           </ul>
         </div>

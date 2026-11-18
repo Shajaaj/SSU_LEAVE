@@ -9,12 +9,13 @@ import {
   X,
 } from 'lucide-react';
 import { StaffProfile } from '../types/portal';
+import { isValidPinFormat } from '../utils/staffAuthId';
 
 interface ChangePasswordModalProps {
   open: boolean;
   forced: boolean;
   profile: StaffProfile;
-  onSubmit: (currentPassword: string, newPassword: string) => Promise<void>;
+  onSubmit: (currentPin: string, newPin: string) => Promise<void>;
   onClose?: () => void;
   onSignOut?: () => void;
 }
@@ -27,9 +28,9 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
   onClose,
   onSignOut,
 }) => {
-  const [currentPassword, setCurrentPassword] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
+  const [currentPin, setCurrentPin] = useState('');
+  const [newPin, setNewPin] = useState('');
+  const [confirmPin, setConfirmPin] = useState('');
   const [showCurrent, setShowCurrent] = useState(false);
   const [showNew, setShowNew] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
@@ -42,30 +43,33 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
     e.preventDefault();
     setError(null);
 
-    if (!currentPassword) {
-      setError('Enter your current password.');
+    const trimmedCurrent = currentPin.trim();
+    const trimmedNew = newPin.trim();
+    const trimmedConfirm = confirmPin.trim();
+
+    if (!isValidPinFormat(trimmedCurrent)) {
+      setError('Current PIN must be 4 to 12 numeric digits.');
       return;
     }
-    const trimmedNew = newPassword.trim();
-    if (trimmedNew.length < 8) {
-      setError('New password must be at least 8 characters long.');
+    if (!isValidPinFormat(trimmedNew)) {
+      setError('New PIN must be 4 to 12 numeric digits.');
       return;
     }
-    if (trimmedNew === currentPassword) {
-      setError('New password must be different from your current password.');
+    if (trimmedNew === trimmedCurrent) {
+      setError('New PIN must be different from your current PIN.');
       return;
     }
-    if (trimmedNew !== confirmPassword.trim()) {
-      setError('New password and confirmation do not match.');
+    if (trimmedNew !== trimmedConfirm) {
+      setError('New PIN and confirmation do not match.');
       return;
     }
 
     setSubmitting(true);
     try {
-      await onSubmit(currentPassword, trimmedNew);
-      setCurrentPassword('');
-      setNewPassword('');
-      setConfirmPassword('');
+      await onSubmit(trimmedCurrent, trimmedNew);
+      setCurrentPin('');
+      setNewPin('');
+      setConfirmPin('');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -93,7 +97,7 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               id="update-password-title"
               className="text-lg font-display font-bold text-[#0B1F3A] dark:text-white"
             >
-              {forced ? 'Update Your Temporary Password' : 'Change Password'}
+              {forced ? 'Set Your Personal PIN' : 'Change PIN'}
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 font-mono">
               {profile.staffId} · {profile.fullName} · {profile.designation}
@@ -114,8 +118,8 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
 
         <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
           {forced
-            ? 'You signed in using an administrator-assigned temporary password. Before accessing your dashboard and leave actions, please set a personal password (minimum 8 characters).'
-            : 'Update your account password. Your credentials are managed securely by Firebase Authentication.'}
+            ? 'You signed in using an initial temporary PIN. Before accessing your dashboard and leave actions, please choose your own personal numeric PIN (4 to 12 digits).'
+            : 'Update your personal numeric PIN. Your updated PIN is hashed on our Cloudflare Worker backend and synced across all devices.'}
         </p>
 
         {error && (
@@ -134,24 +138,27 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               htmlFor="cp-current"
               className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5"
             >
-              Current Password {forced ? '(Temporary Password)' : ''}
+              Current PIN {forced ? '(Initial PIN)' : ''}
             </label>
             <div className="relative">
               <input
                 id="cp-current"
                 type={showCurrent ? 'text' : 'password'}
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={12}
                 autoComplete="current-password"
-                value={currentPassword}
-                onChange={(e) => setCurrentPassword(e.target.value)}
-                placeholder={forced ? 'Enter assigned temporary password' : 'Enter current password'}
-                className="w-full min-h-[44px] sm:min-h-0 pl-3.5 pr-10 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-sm"
+                value={currentPin}
+                onChange={(e) => setCurrentPin(e.target.value.replace(/\D/g, ''))}
+                placeholder={forced ? 'Enter initial PIN' : 'Enter current PIN'}
+                className="w-full min-h-[44px] sm:min-h-0 pl-3.5 pr-10 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-sm font-mono tracking-widest"
                 required
               />
               <button
                 type="button"
                 onClick={() => setShowCurrent((v) => !v)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                aria-label={showCurrent ? 'Hide current password' : 'Show current password'}
+                aria-label={showCurrent ? 'Hide current PIN' : 'Show current PIN'}
               >
                 {showCurrent ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
               </button>
@@ -163,25 +170,28 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               htmlFor="cp-new"
               className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5"
             >
-              New Password (min 8 characters)
+              New Numeric PIN (4 to 12 digits)
             </label>
             <div className="relative">
               <input
                 id="cp-new"
                 type={showNew ? 'text' : 'password'}
+                inputMode="numeric"
+                pattern="[0-9]*"
+                minLength={4}
+                maxLength={12}
                 autoComplete="new-password"
-                minLength={8}
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="Choose a strong personal password"
-                className="w-full min-h-[44px] sm:min-h-0 pl-3.5 pr-10 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-sm"
+                value={newPin}
+                onChange={(e) => setNewPin(e.target.value.replace(/\D/g, ''))}
+                placeholder="Enter 4 to 12 digit PIN"
+                className="w-full min-h-[44px] sm:min-h-0 pl-3.5 pr-10 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-sm font-mono tracking-widest"
                 required
               />
               <button
                 type="button"
                 onClick={() => setShowNew((v) => !v)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                aria-label={showNew ? 'Hide new password' : 'Show new password'}
+                aria-label={showNew ? 'Hide new PIN' : 'Show new PIN'}
               >
                 {showNew ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
               </button>
@@ -193,25 +203,28 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               htmlFor="cp-confirm"
               className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1.5"
             >
-              Confirm New Password
+              Confirm New PIN
             </label>
             <div className="relative">
               <input
                 id="cp-confirm"
                 type={showConfirm ? 'text' : 'password'}
+                inputMode="numeric"
+                pattern="[0-9]*"
+                minLength={4}
+                maxLength={12}
                 autoComplete="new-password"
-                minLength={8}
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder="Re-enter your new password"
-                className="w-full min-h-[44px] sm:min-h-0 pl-3.5 pr-10 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-sm"
+                value={confirmPin}
+                onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, ''))}
+                placeholder="Re-enter your new PIN"
+                className="w-full min-h-[44px] sm:min-h-0 pl-3.5 pr-10 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-sm font-mono tracking-widest"
                 required
               />
               <button
                 type="button"
                 onClick={() => setShowConfirm((v) => !v)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                aria-label={showConfirm ? 'Hide confirm password' : 'Show confirm password'}
+                aria-label={showConfirm ? 'Hide confirm PIN' : 'Show confirm PIN'}
               >
                 {showConfirm ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
               </button>
@@ -244,7 +257,7 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               className="min-h-[44px] sm:min-h-0 px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-xs font-semibold disabled:opacity-60 flex items-center gap-1.5 whitespace-nowrap"
             >
               <ShieldCheck className="w-4 h-4" aria-hidden="true" />
-              <span>{submitting ? 'Updating...' : 'Save New Password'}</span>
+              <span>{submitting ? 'Updating...' : 'Save New PIN'}</span>
             </button>
           </div>
         </form>

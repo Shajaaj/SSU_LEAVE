@@ -106,6 +106,53 @@
       },
       "required": ["uid", "staffId", "role", "designation", "isActive", "updatedAt"]
     },
+    "StaffPinSecret": {
+      "title": "StaffPinSecret",
+      "description": "Server-only PBKDF2-SHA256 PIN credential and lockout counter accessed exclusively by Cloudflare Worker and trusted Admin CLI.",
+      "type": "object",
+      "properties": {
+        "staffId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 24,
+          "pattern": "^[A-Za-z0-9\\-]+$"
+        },
+        "authUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "pinSalt": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 128
+        },
+        "pinHash": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 256
+        },
+        "hashAlgo": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 64
+        },
+        "mustChangePin": {
+          "type": "boolean"
+        },
+        "failedAttempts": {
+          "type": "integer"
+        },
+        "lockedUntilMs": {
+          "type": "integer"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["staffId", "pinSalt", "pinHash", "hashAlgo", "mustChangePin", "updatedAt"]
+    },
     "LeaveRequest": {
       "title": "LeaveRequest",
       "description": "Annual Leave application with date-only YYYY-MM-DD fields in Maldives time (Asia/Male, UTC+5).",
@@ -427,6 +474,10 @@
     "/staffAuthLinks/{uid}": {
       "schema": { "$ref": "#/entities/StaffAuthLink" },
       "description": "Firebase Auth UID -> Staff ID + Role mapping enforced by Firestore Security Rules."
+    },
+    "/staffPinSecrets/{staffId}": {
+      "schema": { "$ref": "#/entities/StaffPinSecret" },
+      "description": "Server-only hashed PIN secrets and lockout counters denied to all client SDKs."
     },
     "/leaveRequests/{requestId}": {
       "schema": { "$ref": "#/entities/LeaveRequest" },
