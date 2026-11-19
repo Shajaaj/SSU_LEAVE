@@ -3,10 +3,12 @@ import {
   AlertTriangle,
   Download,
   KeyRound,
+  Plus,
   Settings,
   ShieldCheck,
   Terminal,
   Trash2,
+  UserPlus,
 } from 'lucide-react';
 import {
   AppSettings,
@@ -17,6 +19,7 @@ import {
 } from '../types/portal';
 import { downloadCsv } from '../utils/csvExport';
 import { formatTimestampForDisplay } from '../utils/maldivesDate';
+import { isValidStaffIdFormat, normalizeStaffIdToken } from '../utils/staffAuthId';
 import { StaffStatusLabel } from './StatusLabel';
 
 /* -------------------------------------------------------------------------- */
@@ -27,6 +30,12 @@ interface AdministrationViewProps {
   currentProfile: StaffProfile;
   profiles: StaffProfile[];
   settings: AppSettings;
+  onAddStaff?: (payload: {
+    staffId: string;
+    fullName: string;
+    designation: Designation;
+    role: UserRole;
+  }) => Promise<void>;
   onUpdateStaff: (
     target: StaffProfile,
     updates: {
@@ -50,11 +59,22 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
   currentProfile,
   profiles,
   settings,
+  onAddStaff,
   onUpdateStaff,
   onRemoveStaff,
   onResetStaffPin,
   onUpdateSettings,
 }) => {
+  // Add Staff Modal
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [newStaffId, setNewStaffId] = useState('');
+  const [newFullName, setNewFullName] = useState('');
+  const [newDesignation, setNewDesignation] =
+    useState<Designation>('ASSISTANT OFFICER');
+  const [newRole, setNewRole] = useState<UserRole>('staff');
+  const [addingStaff, setAddingStaff] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+
   // Edit Staff Modal
   const [editingTarget, setEditingTarget] = useState<StaffProfile | null>(null);
   const [editName, setEditName] = useState('');
@@ -83,6 +103,59 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
     settings.maxAnnualLeavePeriods || 3
   );
   const [savingSettings, setSavingSettings] = useState(false);
+
+  const openAddModal = () => {
+    setNewStaffId('');
+    setNewFullName('');
+    setNewDesignation('ASSISTANT OFFICER');
+    setNewRole('staff');
+    setAddError(null);
+    setAddModalOpen(true);
+  };
+
+  const handleSaveNewStaff = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!onAddStaff) return;
+
+    setAddError(null);
+    const trimmedStaffId = newStaffId.trim();
+    const trimmedFullName = newFullName.trim();
+
+    if (!isValidStaffIdFormat(trimmedStaffId)) {
+      setAddError('Staff ID must be 2 to 24 letters, numbers, or hyphens.');
+      return;
+    }
+    if (trimmedFullName.length < 2 || trimmedFullName.length > 100) {
+      setAddError('Full Name must be between 2 and 100 characters.');
+      return;
+    }
+
+    const normalizedCandidate = normalizeStaffIdToken(trimmedStaffId);
+    const duplicate = profiles.find(
+      (p) => normalizeStaffIdToken(p.staffId) === normalizedCandidate
+    );
+    if (duplicate) {
+      setAddError(
+        `Staff ID ${duplicate.staffId} already exists (${duplicate.fullName}). Duplicate Staff IDs are not allowed.`
+      );
+      return;
+    }
+
+    setAddingStaff(true);
+    try {
+      await onAddStaff({
+        staffId: trimmedStaffId,
+        fullName: trimmedFullName,
+        designation: newDesignation,
+        role: newRole,
+      });
+      setAddModalOpen(false);
+    } catch (err) {
+      setAddError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAddingStaff(false);
+    }
+  };
 
   const openEditModal = (p: StaffProfile) => {
     setEditingTarget(p);
@@ -128,59 +201,27 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Trusted Local Admin CLI Notice (Spark Free Tier Security Boundary) */}
-      <section className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-3">
-        <div className="flex items-start justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-3">
-          <div>
-            <h2 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white flex items-center gap-2">
-              <Terminal className="w-4 h-4 text-teal-600 dark:text-teal-400" aria-hidden="true" />
-              <span>Trusted Admin CLI — Provisioning, Bulk Import &amp; PIN Resets</span>
-            </h2>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
-              Service account credentials stay exclusively in encrypted Cloudflare Worker secrets and trusted administrator CLI environments. Creating new staff records, bulk importing rosters, or cleaning up removed auth credentials is executed from an administrator workstation, while PIN resets can be issued either directly below or via CLI.
-            </p>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 text-xs">
-          <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-1.5">
-            <p className="font-semibold text-[#0B1F3A] dark:text-teal-300">
-              1. Provision New Staff Account
-            </p>
-            <code className="block font-mono text-[11px] bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded p-2 overflow-x-auto text-slate-800 dark:text-slate-200">
-              npx tsx scripts/adminStaffAuth.ts provision A-10018 &quot;Full Name&quot; &quot;ASSISTANT OFFICER&quot;
-            </code>
-          </div>
-
-          <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-1.5">
-            <p className="font-semibold text-[#0B1F3A] dark:text-teal-300">
-              2. Bulk Import CSV / Markdown Roster
-            </p>
-            <code className="block font-mono text-[11px] bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded p-2 overflow-x-auto text-slate-800 dark:text-slate-200">
-              npx tsx scripts/adminStaffAuth.ts import ./roster.csv
-            </code>
-          </div>
-
-          <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-1.5">
-            <p className="font-semibold text-[#0B1F3A] dark:text-teal-300">
-              3. Admin PIN Reset
-            </p>
-            <code className="block font-mono text-[11px] bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded p-2 overflow-x-auto text-slate-800 dark:text-slate-200">
-              npx tsx scripts/adminStaffAuth.ts reset-pin A-7111
-            </code>
-          </div>
-        </div>
-      </section>
-
       {/* Account Management & Role Assignment */}
       <section className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-4">
-        <div className="flex items-center justify-between gap-2">
-          <h2 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white">
-            Account Roles, Deactivation & Removal
-          </h2>
-          <span className="text-xs font-mono text-slate-500 dark:text-slate-400 shrink-0">
-            {profiles.length} records
-          </span>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-baseline gap-2">
+            <h2 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white">
+              Account Roles, Deactivation &amp; Removal
+            </h2>
+            <span className="text-xs font-mono text-slate-500 dark:text-slate-400 shrink-0">
+              {profiles.length} records
+            </span>
+          </div>
+          {currentProfile.role === 'manager' && onAddStaff && (
+            <button
+              type="button"
+              onClick={openAddModal}
+              className="min-h-[40px] sm:min-h-0 px-3.5 py-2 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shadow-xs transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>Add Staff</span>
+            </button>
+          )}
         </div>
 
         {/* Mobile Account Cards */}
@@ -364,6 +405,161 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
           </div>
         </form>
       </section>
+
+      {/* Trusted Local Admin CLI Reference */}
+      <section className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-3">
+        <div className="flex items-start justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-3">
+          <div>
+            <h2 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white flex items-center gap-2">
+              <Terminal className="w-4 h-4 text-teal-600 dark:text-teal-400" aria-hidden="true" />
+              <span>Trusted Admin CLI — Bulk Import &amp; Maintenance</span>
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
+              Service account credentials stay exclusively in encrypted Cloudflare Worker secrets and trusted administrator CLI environments. Individual staff accounts can be added directly above, while bulk roster imports and CLI operations can also be run from an administrator workstation.
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 text-xs">
+          <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-1.5">
+            <p className="font-semibold text-[#0B1F3A] dark:text-teal-300">
+              1. Provision New Staff Account
+            </p>
+            <code className="block font-mono text-[11px] bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded p-2 overflow-x-auto text-slate-800 dark:text-slate-200">
+              npx tsx scripts/adminStaffAuth.ts provision A-10018 &quot;Full Name&quot; &quot;ASSISTANT OFFICER&quot;
+            </code>
+          </div>
+
+          <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-1.5">
+            <p className="font-semibold text-[#0B1F3A] dark:text-teal-300">
+              2. Bulk Import CSV / Markdown Roster
+            </p>
+            <code className="block font-mono text-[11px] bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded p-2 overflow-x-auto text-slate-800 dark:text-slate-200">
+              npx tsx scripts/adminStaffAuth.ts import ./roster.csv
+            </code>
+          </div>
+
+          <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 space-y-1.5">
+            <p className="font-semibold text-[#0B1F3A] dark:text-teal-300">
+              3. Admin PIN Reset
+            </p>
+            <code className="block font-mono text-[11px] bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded p-2 overflow-x-auto text-slate-800 dark:text-slate-200">
+              npx tsx scripts/adminStaffAuth.ts reset-pin A-7111
+            </code>
+          </div>
+        </div>
+      </section>
+
+      {/* Add Staff Modal */}
+      {addModalOpen && currentProfile.role === 'manager' && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-t-2xl sm:rounded-xl max-w-md w-full p-5 sm:p-6 space-y-4 shadow-xl max-h-[92vh] overflow-y-auto">
+            <div className="flex items-center gap-2 text-teal-700 dark:text-teal-400">
+              <UserPlus className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <h3 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white">
+                Add New Staff Member
+              </h3>
+            </div>
+
+            <form onSubmit={handleSaveNewStaff} className="space-y-3 text-xs">
+              <div>
+                <label htmlFor="add-staff-id" className="block font-semibold mb-1">
+                  Staff ID
+                </label>
+                <input
+                  id="add-staff-id"
+                  type="text"
+                  value={newStaffId}
+                  onChange={(e) => setNewStaffId(e.target.value)}
+                  placeholder="e.g. A-10018"
+                  autoComplete="off"
+                  className="w-full min-h-[42px] sm:min-h-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-xs font-mono"
+                  required
+                />
+              </div>
+
+              <div>
+                <label htmlFor="add-staff-name" className="block font-semibold mb-1">
+                  Full Name
+                </label>
+                <input
+                  id="add-staff-name"
+                  type="text"
+                  value={newFullName}
+                  onChange={(e) => setNewFullName(e.target.value)}
+                  placeholder="e.g. Aminath Ali"
+                  className="w-full min-h-[42px] sm:min-h-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-xs"
+                  required
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="add-staff-designation" className="block font-semibold mb-1">
+                    Designation
+                  </label>
+                  <select
+                    id="add-staff-designation"
+                    value={newDesignation}
+                    onChange={(e) => setNewDesignation(e.target.value as Designation)}
+                    className="w-full min-h-[42px] sm:min-h-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-xs"
+                  >
+                    <option value="MANAGER">Manager</option>
+                    <option value="EXECUTIVE">Executive</option>
+                    <option value="OFFICER">Officer</option>
+                    <option value="ASSISTANT OFFICER">Assistant Officer</option>
+                    <option value="ATTENDANT">Attendant</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label htmlFor="add-staff-role" className="block font-semibold mb-1">
+                    Role
+                  </label>
+                  <select
+                    id="add-staff-role"
+                    value={newRole}
+                    onChange={(e) => setNewRole(e.target.value as UserRole)}
+                    className="w-full min-h-[42px] sm:min-h-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-xs"
+                  >
+                    <option value="staff">Staff</option>
+                    <option value="executive">Executive</option>
+                    <option value="manager">Manager</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed">
+                Default PIN will be set to <span className="font-mono font-bold">1234</span>. The employee will be required to change their PIN on first login and can sign in immediately across all devices.
+              </div>
+
+              {addError && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-700 dark:text-red-300">
+                  {addError}
+                </div>
+              )}
+
+              <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  disabled={addingStaff}
+                  onClick={() => setAddModalOpen(false)}
+                  className="w-full sm:w-auto min-h-[44px] sm:min-h-0 px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-700 font-semibold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={addingStaff}
+                  className="w-full sm:w-auto min-h-[44px] sm:min-h-0 px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-700 text-white font-semibold disabled:opacity-60"
+                >
+                  {addingStaff ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Edit Staff Modal */}
       {editingTarget && (

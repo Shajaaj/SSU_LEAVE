@@ -1004,6 +1004,200 @@ async function handleAdminResetPin(request: Request, env: WorkerEnv): Promise<Re
   return jsonResponse({ ok: true, staffId: canonicalId });
 }
 
+const ALLOWED_ADD_STAFF_DESIGNATIONS = new Set([
+  'MANAGER',
+  'EXECUTIVE',
+  'OFFICER',
+  'ASSISTANT OFFICER',
+  'ATTENDANT',
+]);
+
+const ALLOWED_ADD_STAFF_ROLES = new Set(['staff', 'executive', 'manager']);
+
+async function handleAddStaff(request: Request, env: WorkerEnv): Promise<Response> {
+  const ipLimit = checkIpRateLimit(request, env);
+  if (!ipLimit.allowed) {
+    return jsonResponse(
+      { error: 'Too many requests. Please wait a moment and try again.' },
+      429,
+      { 'Retry-After': String(ipLimit.retryAfterSec) }
+    );
+  }
+
+  const authHeader = request.headers.get('Authorization') || '';
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  if (!idToken) {
+    return jsonResponse({ error: 'Authentication required.' }, 401);
+  }
+
+  let body: {
+    staffId?: unknown;
+    fullName?: unknown;
+    designation?: unknown;
+    role?: unknown;
+  };
+  try {
+    body = (await request.json()) as {
+      staffId?: unknown;
+      fullName?: unknown;
+      designation?: unknown;
+      role?: unknown;
+    };
+  } catch {
+    return jsonResponse({ error: 'Invalid request payload.' }, 400);
+  }
+
+  const staffId = typeof body.staffId === 'string' ? body.staffId.trim() : '';
+  const fullName = typeof body.fullName === 'string' ? body.fullName.trim() : '';
+  const designation =
+    typeof body.designation === 'string'
+      ? body.designation.trim().toUpperCase().replace(/\s+/g, ' ')
+      : '';
+  const role = typeof body.role === 'string' ? body.role.trim().toLowerCase() : '';
+
+  if (!isValidStaffIdFormat(staffId)) {
+    return jsonResponse(
+      { error: 'Staff ID must be 2 to 24 letters, numbers, or hyphens.' },
+      400
+    );
+  }
+  if (fullName.length < 2 || fullName.length > 100) {
+    return jsonResponse(
+      { error: 'Full Name must be between 2 and 100 characters.' },
+      400
+    );
+  }
+  if (!ALLOWED_ADD_STAFF_DESIGNATIONS.has(designation)) {
+    return jsonResponse({ error: 'Please select a valid designation.' }, 400);
+  }
+  if (!ALLOWED_ADD_STAFF_ROLES.has(role)) {
+    return jsonResponse({ error: 'Please select a valid role.' }, 400);
+  }
+
+  const sa = parseServiceAccount(env);
+  const projectId = env.FIREBASE_PROJECT_ID?.trim() || sa.project_id;
+
+  let actorUid: string;
+  try {
+    const verified = await verifyFirebaseIdToken(idToken, projectId);
+    actorUid = verified.uid;
+  } catch (err) {
+    return jsonResponse(
+      { error: err instanceof Error ? err.message : 'Unauthorized session.' },
+      401
+    );
+  }
+
+  const accessToken = await getGoogleAccessToken(sa);
+  const actorLink = await fsGetDoc(projectId, accessToken, `staffAuthLinks/${actorUid}`);
+  if (
+    !actorLink?.fields ||
+    !fsBool(actorLink.fields, 'isActive', false) ||
+    fsStr(actorLink.fields, 'role') !== 'manager'
+  ) {
+    return jsonResponse({ error: 'Only active Managers can add staff accounts.' }, 403);
+  }
+
+  const actorStaffId = fsStr(actorLink.fields, 'staffId');
+  const actorDoc = await fsGetDoc(projectId, accessToken, `staff/${actorStaffId}`);
+  const actorName = fsStr(actorDoc?.fields, 'fullName') || actorStaffId;
+
+  // Prevent duplicate Staff IDs (exact or normalized token match)
+  const existingStaff = await findAuthorizedStaffDoc(projectId, accessToken, staffId);
+  if (existingStaff) {
+    return jsonResponse(
+      { error: `Staff ID ${existingStaff.staffId} already exists.` },
+      409
+    );
+  }
+
+  const uid = deterministicStaffUid(staffId);
+  const [existingLink, existingSecret] = await Promise.all([
+    fsGetDoc(projectId, accessToken, `staffAuthLinks/${uid}`),
+    fsGetDoc(projectId, accessToken, `staffPinSecrets/${staffId}`),
+  ]);
+  if (existingLink || existingSecret) {
+    return jsonResponse(
+      { error: `A staff account with Staff ID ${staffId} already exists.` },
+      409
+    );
+  }
+
+  const nowIso = new Date().toISOString();
+  const pinSalt = generateSaltHex(16);
+  const pinHash = await hashPinPbkdf2('1234', pinSalt);
+  const countsTowardDailyCap =
+    designation === 'ASSISTANT OFFICER' || designation === 'ATTENDANT';
+
+  try {
+    await fsCreateDoc(projectId, accessToken, 'staffPinSecrets', staffId, {
+      staffId: { stringValue: staffId },
+      authUid: { stringValue: uid },
+      pinSalt: { stringValue: pinSalt },
+      pinHash: { stringValue: pinHash },
+      hashAlgo: { stringValue: 'pbkdf2-sha256-100000' },
+      mustChangePin: { booleanValue: true },
+      failedAttempts: { integerValue: '0' },
+      lockedUntilMs: { integerValue: '0' },
+      updatedAt: { timestampValue: nowIso },
+    });
+
+    await fsCreateDoc(projectId, accessToken, 'staffAuthLinks', uid, {
+      uid: { stringValue: uid },
+      staffId: { stringValue: staffId },
+      role: { stringValue: role },
+      designation: { stringValue: designation },
+      isActive: { booleanValue: true },
+      updatedAt: { timestampValue: nowIso },
+    });
+
+    await fsCreateDoc(projectId, accessToken, 'staff', staffId, {
+      staffId: { stringValue: staffId },
+      authUid: { stringValue: uid },
+      fullName: { stringValue: fullName },
+      designation: { stringValue: designation },
+      role: { stringValue: role },
+      isActive: { booleanValue: true },
+      mustChangePassword: { booleanValue: true },
+      unitSection: { stringValue: 'Special Services' },
+      annualPeriodLimit: { integerValue: '3' },
+      countsTowardDailyCap: { booleanValue: countsTowardDailyCap },
+      createdAt: { timestampValue: nowIso },
+      updatedAt: { timestampValue: nowIso },
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('(409)')) {
+      return jsonResponse(
+        { error: `Staff ID ${staffId} already exists.` },
+        409
+      );
+    }
+    throw err;
+  }
+
+  const logId = makeServerId('log');
+  await fsCreateDoc(projectId, accessToken, 'auditLogs', logId, {
+    logId: { stringValue: logId },
+    action: { stringValue: 'STAFF_PROVISIONED' },
+    targetType: { stringValue: 'staff' },
+    targetId: { stringValue: staffId },
+    actorStaffId: { stringValue: actorStaffId },
+    actorName: { stringValue: actorName },
+    actorRole: { stringValue: 'manager' },
+    summary: {
+      stringValue: `Manager ${actorStaffId} added staff ${staffId} (${fullName}, ${designation}, role=${role}) with default PIN.`,
+    },
+    newStatus: { stringValue: 'active' },
+    createdAt: { timestampValue: nowIso },
+  });
+
+  return jsonResponse({
+    ok: true,
+    staffId,
+    uid,
+  });
+}
+
 export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     const url = new URL(request.url);
@@ -1026,6 +1220,9 @@ export default {
         }
         if (request.method === 'POST' && url.pathname === '/api/admin/reset-pin') {
           return await handleAdminResetPin(request, env);
+        }
+        if (request.method === 'POST' && url.pathname === '/api/admin/add-staff') {
+          return await handleAddStaff(request, env);
         }
         return jsonResponse({ error: 'Not found.' }, 404);
       } catch (err) {

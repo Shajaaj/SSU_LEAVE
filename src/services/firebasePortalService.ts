@@ -304,6 +304,41 @@ export async function resetStaffPinByManager(
   );
 }
 
+export async function addStaffByManager(payload: {
+  staffId: string;
+  fullName: string;
+  designation: Designation;
+  role: UserRole;
+}): Promise<{ staffId: string }> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please sign in again.');
+  }
+
+  const trimmedStaffId = payload.staffId.trim();
+  const trimmedFullName = payload.fullName.trim();
+  if (!isValidStaffIdFormat(trimmedStaffId)) {
+    throw new Error('Staff ID must be 2 to 24 letters, numbers, or hyphens.');
+  }
+  if (trimmedFullName.length < 2 || trimmedFullName.length > 100) {
+    throw new Error('Full Name must be between 2 and 100 characters.');
+  }
+
+  const idToken = await user.getIdToken(true);
+  const res = await postWorkerJson<{ ok: boolean; staffId: string }>(
+    '/api/admin/add-staff',
+    {
+      staffId: trimmedStaffId,
+      fullName: trimmedFullName,
+      designation: payload.designation,
+      role: payload.role,
+    },
+    idToken
+  );
+
+  return { staffId: res.staffId };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Real-Time onSnapshot Subscriptions                                         */
 /* -------------------------------------------------------------------------- */

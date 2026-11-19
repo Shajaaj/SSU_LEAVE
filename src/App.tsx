@@ -25,6 +25,7 @@ import { StaffDashboard } from './components/StaffDashboard';
 import { auth } from './firebase/client';
 import {
   DEFAULT_APP_SETTINGS,
+  addStaffByManager,
   approveLeaveRequest,
   cancelPendingLeaveRequest,
   changeOwnPassword,
@@ -455,6 +456,20 @@ export default function App() {
     );
   };
 
+  const handleAddStaff = async (payload: {
+    staffId: string;
+    fullName: string;
+    designation: Designation;
+    role: UserRole;
+  }) => {
+    await addStaffByManager(payload);
+    addToast(
+      'success',
+      'Staff Account Added',
+      `${payload.fullName.trim()} (${payload.staffId.trim()}) can now sign in with default PIN 1234.`
+    );
+  };
+
   const handleUpdateSettings = async (next: {
     maxDailyCombinedCap: number;
     maxAnnualLeavePeriods: number;
@@ -589,6 +604,7 @@ export default function App() {
           currentProfile={liveProfile}
           profiles={liveProfiles}
           settings={liveSettings}
+          onAddStaff={handleAddStaff}
           onUpdateStaff={handleUpdateStaff}
           onRemoveStaff={handleRemoveStaff}
           onResetStaffPin={handleResetStaffPin}
