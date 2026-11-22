@@ -141,7 +141,9 @@ service cloud.firestore {
 
     function isValidDailyCapacity(data, dateKey) {
       return data.keys().hasAll(['date', 'approvedCount', 'maxCapacity', 'updatedAt'])
-        && data.keys().hasOnly(['date', 'approvedCount', 'maxCapacity', 'updatedAt'])
+        && data.keys().hasOnly([
+          'date', 'approvedCount', 'approvedOnlyCount', 'pendingCount', 'maxCapacity', 'updatedAt'
+        ])
         && data.date == dateKey
         && isValidDateKey(data.date)
         && data.approvedCount is int
@@ -150,6 +152,8 @@ service cloud.firestore {
         && data.maxCapacity <= 10
         && data.approvedCount >= 0
         && data.approvedCount <= data.maxCapacity
+        && (!('approvedOnlyCount' in data) || (data.approvedOnlyCount is int && data.approvedOnlyCount >= 0 && data.approvedOnlyCount <= data.maxCapacity))
+        && (!('pendingCount' in data) || (data.pendingCount is int && data.pendingCount >= 0 && data.pendingCount <= data.maxCapacity))
         && data.updatedAt is timestamp;
     }
 
@@ -159,7 +163,7 @@ service cloud.firestore {
         && data.date == dateKey
         && isValidDateKey(data.date)
         && data.allocations is list
-        && data.allocations.size() <= 25
+        && data.allocations.size() <= 60
         && (data.allocations.size() == 0 || data.allocations[0] is map)
         && data.updatedAt is timestamp;
     }
@@ -178,12 +182,13 @@ service cloud.firestore {
         && isValidId(data.logId)
         && data.action in [
           'LEAVE_SUBMITTED', 'LEAVE_APPROVED', 'LEAVE_REJECTED',
-          'LEAVE_CANCELLED', 'LEAVE_MODIFIED', 'MOD_REQUESTED',
+          'LEAVE_CANCELLED', 'LEAVE_MODIFIED', 'LEAVE_DATA_CLEARED',
+          'RESTRICTION_SAVED', 'RESTRICTION_REMOVED', 'MOD_REQUESTED',
           'STAFF_PROVISIONED', 'STAFF_IMPORTED', 'STAFF_UPDATED',
           'STAFF_DEACTIVATED', 'STAFF_REMOVED', 'SETTINGS_UPDATED',
           'PASSWORD_UPDATED', 'PASSWORD_RESET_COMPLETED'
         ]
-        && data.targetType in ['leaveRequest', 'staff', 'appSettings']
+        && data.targetType in ['leaveRequest', 'staff', 'appSettings', 'leaveRestriction']
         && data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 128
         && data.actorStaffId is string && data.actorStaffId.size() >= 1 && data.actorStaffId.size() <= 24
         && data.actorName is string && data.actorName.size() >= 1 && data.actorName.size() <= 100
@@ -193,6 +198,37 @@ service cloud.firestore {
         && (!('newStatus' in data) || (data.newStatus is string && data.newStatus.size() <= 30))
         && (!('affectedDates' in data) || (data.affectedDates is list && data.affectedDates.size() <= 31))
         && data.createdAt is timestamp;
+    }
+
+    function isValidLeaveRestriction(data, restrictionId) {
+      return data.keys().hasAll([
+          'restrictionId', 'startDate', 'endDate', 'targetType',
+          'targetStaffIds', 'reason', 'isActive',
+          'createdByStaffId', 'createdByName', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'restrictionId', 'startDate', 'endDate', 'targetType',
+          'targetStaffIds', 'targetStaffNames', 'reason', 'isActive',
+          'createdByStaffId', 'createdByName', 'createdAt', 'updatedAt'
+        ])
+        && data.restrictionId == restrictionId
+        && isValidId(data.restrictionId)
+        && isValidDateKey(data.startDate)
+        && isValidDateKey(data.endDate)
+        && data.startDate <= data.endDate
+        && data.targetType in [
+          'all', 'assistant_officer', 'attendant',
+          'executive', 'officer', 'selected_staff'
+        ]
+        && data.targetStaffIds is list
+        && data.targetStaffIds.size() <= 300
+        && (!('targetStaffNames' in data) || (data.targetStaffNames is list && data.targetStaffNames.size() <= 300))
+        && data.reason is string && data.reason.size() >= 3 && data.reason.size() <= 300
+        && data.isActive is bool
+        && data.createdByStaffId is string && data.createdByStaffId.size() >= 1 && data.createdByStaffId.size() <= 24
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 100
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
     }
 
     function isValidAppSettings(data) {
@@ -428,6 +464,25 @@ service cloud.firestore {
         && incoming().updatedByStaffId == callerStaffId()
         && incoming().updatedAt == request.time;
       allow delete: if false;
+    }
+
+    // Blocked Leave Date Restrictions
+    match /leaveRestrictions/{restrictionId} {
+      allow get, list: if isActiveCaller();
+      allow create: if isManager()
+        && isValidId(restrictionId)
+        && isValidLeaveRestriction(incoming(), restrictionId)
+        && incoming().createdByStaffId == callerStaffId()
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isManager()
+        && isValidId(restrictionId)
+        && isValidLeaveRestriction(incoming(), restrictionId)
+        && incoming().restrictionId == existing().restrictionId
+        && incoming().createdByStaffId == existing().createdByStaffId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isManager() && isValidId(restrictionId);
     }
   }
 }

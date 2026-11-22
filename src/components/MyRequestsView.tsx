@@ -1,12 +1,24 @@
 import React, { useMemo, useState } from 'react';
 import { AlertCircle, CalendarClock, Edit3, Plus, XCircle } from 'lucide-react';
-import { LeaveRequest, LeaveStatus, StaffProfile } from '../types/portal';
-import { formatDisplayDate, formatTimestampForDisplay } from '../utils/maldivesDate';
+import {
+  LeaveRequest,
+  LeaveRestriction,
+  LeaveStatus,
+  StaffProfile,
+} from '../types/portal';
+import {
+  expandDateRange,
+  formatDisplayDate,
+  formatTimestampForDisplay,
+} from '../utils/maldivesDate';
+import { findRestrictedDatesForStaff, formatLongDate } from '../utils/leaveRestrictions';
+import { LeaveRestrictedPopup } from './LeaveRestrictedPopup';
 import { LeaveStatusLabel } from './StatusLabel';
 
 interface MyRequestsViewProps {
   profile: StaffProfile;
   requests: LeaveRequest[];
+  restrictions?: LeaveRestriction[];
   loading: boolean;
   onOpenNewRequest: () => void;
   onCancelPending: (req: LeaveRequest) => Promise<void>;
@@ -20,7 +32,9 @@ interface MyRequestsViewProps {
 }
 
 export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
+  profile,
   requests,
+  restrictions = [],
   loading,
   onOpenNewRequest,
   onCancelPending,
@@ -36,11 +50,32 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
   const [modStart, setModStart] = useState('');
   const [modEnd, setModEnd] = useState('');
   const [modError, setModError] = useState<string | null>(null);
+  const [dismissedModPopupSig, setDismissedModPopupSig] = useState<string | null>(null);
 
   const filtered = useMemo(() => {
     if (filterStatus === 'all') return requests;
     return requests.filter((r) => r.status === filterStatus);
   }, [requests, filterStatus]);
+
+  const modRestrictionCheck = useMemo(() => {
+    if (!modTarget || modType !== 'edit' || !modStart || !modEnd || modStart > modEnd) {
+      return { blockedDates: [], matchedRestrictions: [] };
+    }
+    const exp = expandDateRange(modStart, modEnd, 30);
+    if (exp.error) return { blockedDates: [], matchedRestrictions: [] };
+    return findRestrictedDatesForStaff(exp.dates, restrictions, profile);
+  }, [modTarget, modType, modStart, modEnd, restrictions, profile]);
+
+  const modBlockedSig =
+    modRestrictionCheck.matchedRestrictions.length > 0
+      ? `${modStart}_${modEnd}_${modRestrictionCheck.matchedRestrictions
+          .map((r) => r.restrictionId)
+          .join(',')}`
+      : null;
+
+  const showModRestrictedPopup = Boolean(
+    modTarget && modType === 'edit' && modBlockedSig && modBlockedSig !== dismissedModPopupSig
+  );
 
   const openModModal = (req: LeaveRequest, type: 'edit' | 'cancel') => {
     setModTarget(req);
@@ -49,6 +84,7 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
     setModEnd(req.endDate);
     setModNote('');
     setModError(null);
+    setDismissedModPopupSig(null);
   };
 
   const handleSubmitMod = async (e: React.FormEvent) => {
@@ -61,6 +97,14 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
     }
     if (modType === 'edit' && (!modStart || !modEnd || modStart > modEnd)) {
       setModError('Provide a valid date range where end date is on or after start date.');
+      return;
+    }
+    if (modType === 'edit' && modRestrictionCheck.matchedRestrictions.length > 0) {
+      setDismissedModPopupSig(null);
+      const primary = modRestrictionCheck.matchedRestrictions[0];
+      setModError(
+        `Leave applications are not permitted from ${formatLongDate(primary.startDate)} to ${formatLongDate(primary.endDate)}. Reason: ${primary.reason}. Please select alternative dates.`
+      );
       return;
     }
 
@@ -337,6 +381,13 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
           </div>
         </div>
       )}
+
+      <LeaveRestrictedPopup
+        open={showModRestrictedPopup}
+        blockedDates={modRestrictionCheck.blockedDates}
+        matchedRestrictions={modRestrictionCheck.matchedRestrictions}
+        onClose={() => setDismissedModPopupSig(modBlockedSig)}
+      />
     </div>
   );
 };

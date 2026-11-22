@@ -3,15 +3,24 @@ import { AlertCircle, Calendar, CheckCircle2, X } from 'lucide-react';
 import {
   AppSettings,
   DailyCapacity,
+  DailyCapacityDetail,
   LeaveRequest,
+  LeaveRestriction,
   LeaveType,
   StaffProfile,
 } from '../types/portal';
+import { fetchCapacityForDates } from '../services/firebasePortalService';
 import {
   calculateAnnualPeriodUsage,
+  getDailyCapacityBreakdown,
   validateLeaveSubmission,
 } from '../utils/leaveRules';
-import { formatDisplayDate, getTodayInMaldives } from '../utils/maldivesDate';
+import {
+  expandDateRange,
+  formatDisplayDate,
+  getTodayInMaldives,
+} from '../utils/maldivesDate';
+import { LeaveRestrictedPopup } from './LeaveRestrictedPopup';
 
 interface LeaveRequestModalProps {
   open: boolean;
@@ -19,8 +28,10 @@ interface LeaveRequestModalProps {
   staff: StaffProfile;
   userRequests: LeaveRequest[];
   capacityMap: Record<string, DailyCapacity>;
+  capacityDetailsMap?: Record<string, DailyCapacityDetail>;
   pendingDemandMap: Record<string, number>;
   settings: AppSettings;
+  restrictions?: LeaveRestriction[];
   initialStartDate?: string;
   initialEndDate?: string;
   onSubmit: (payload: {
@@ -38,8 +49,10 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
   staff,
   userRequests,
   capacityMap,
+  capacityDetailsMap,
   pendingDemandMap,
   settings,
+  restrictions = [],
   initialStartDate,
   initialEndDate,
   onSubmit,
@@ -51,6 +64,11 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
   const [reason, setReason] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [dismissedPopupSig, setDismissedPopupSig] = useState<string | null>(null);
+  const [extraCapMap, setExtraCapMap] = useState<Record<string, DailyCapacity>>({});
+  const [extraDetailsMap, setExtraDetailsMap] = useState<
+    Record<string, DailyCapacityDetail>
+  >({});
 
   useEffect(() => {
     if (open) {
@@ -60,8 +78,48 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
       setEndDate(e);
       setReason('');
       setSubmitError(null);
+      setDismissedPopupSig(null);
+      setExtraCapMap({});
+      setExtraDetailsMap({});
     }
   }, [open, initialStartDate, initialEndDate, today]);
+
+  const expandedPreviewDates = useMemo(() => {
+    if (!open || !startDate || !endDate) return [];
+    const exp = expandDateRange(startDate, endDate, 30);
+    return exp.error ? [] : exp.dates;
+  }, [open, startDate, endDate]);
+
+  useEffect(() => {
+    if (!open || expandedPreviewDates.length === 0) return;
+    const missing = expandedPreviewDates.filter(
+      (d) => !(d in capacityMap) && !(d in extraCapMap)
+    );
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+    void fetchCapacityForDates(missing)
+      .then((res) => {
+        if (cancelled) return;
+        setExtraCapMap((prev) => ({ ...prev, ...res.capacityMap }));
+        setExtraDetailsMap((prev) => ({ ...prev, ...res.capacityDetailsMap }));
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, expandedPreviewDates, capacityMap, extraCapMap]);
+
+  const mergedCapacityMap = useMemo(
+    () => ({ ...extraCapMap, ...capacityMap }),
+    [extraCapMap, capacityMap]
+  );
+
+  const mergedDetailsMap = useMemo(
+    () => ({ ...extraDetailsMap, ...(capacityDetailsMap || {}) }),
+    [extraDetailsMap, capacityDetailsMap]
+  );
 
   const calendarYear = Number((startDate || today).slice(0, 4));
   const annualUsage = useMemo(
@@ -83,11 +141,40 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
         endDate,
         reason,
         userRequests,
-        capacityMap,
+        capacityMap: mergedCapacityMap,
         pendingDemandMap,
+        capacityDetailsMap: mergedDetailsMap,
         settings,
+        restrictions,
       }),
-    [staff, startDate, endDate, reason, userRequests, capacityMap, pendingDemandMap, settings]
+    [
+      staff,
+      startDate,
+      endDate,
+      reason,
+      userRequests,
+      mergedCapacityMap,
+      pendingDemandMap,
+      mergedDetailsMap,
+      settings,
+      restrictions,
+    ]
+  );
+
+  const blockedSig =
+    validation.matchedRestrictions.length > 0
+      ? `${startDate}_${endDate}_${validation.matchedRestrictions
+          .map((r) => r.restrictionId)
+          .join(',')}`
+      : null;
+
+  const showRestrictedPopup = Boolean(
+    open && blockedSig && blockedSig !== dismissedPopupSig
+  );
+
+  const blockedDatesSet = useMemo(
+    () => new Set(validation.blockedDates),
+    [validation.blockedDates]
   );
 
   if (!open) return null;
@@ -95,6 +182,14 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError(null);
+    if (validation.matchedRestrictions.length > 0) {
+      setDismissedPopupSig(null);
+      setSubmitError(
+        validation.errors[validation.errors.length - 1] ||
+          'Selected dates fall inside a restricted leave period.'
+      );
+      return;
+    }
     if (!validation.valid) {
       setSubmitError(validation.errors[0] || 'Please resolve the highlighted policy checks.');
       return;
@@ -230,10 +325,17 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
               </div>
               <div className="max-h-36 overflow-y-auto border border-slate-200 dark:border-slate-800 rounded-lg divide-y divide-slate-100 dark:divide-slate-800">
                 {validation.dates.map((d) => {
-                  const used = capacityMap[d]?.approvedCount || 0;
-                  const cap = capacityMap[d]?.maxCapacity || settings.maxDailyCombinedCap || 10;
-                  const pending = pendingDemandMap[d] || 0;
-                  const blocked = staff.countsTowardDailyCap && used >= cap;
+                  const breakdown = getDailyCapacityBreakdown({
+                    dateKey: d,
+                    capacityMap: mergedCapacityMap,
+                    pendingDemandMap,
+                    capacityDetailsMap: mergedDetailsMap,
+                    defaultMaxCap: settings.maxDailyCombinedCap || 10,
+                    pendingReservesCapacity: Boolean(settings.pendingReservesCapacity),
+                  });
+                  const isCapFull = staff.countsTowardDailyCap && breakdown.isFull;
+                  const isRestricted = blockedDatesSet.has(d);
+                  const blocked = isCapFull || isRestricted;
                   return (
                     <div
                       key={d}
@@ -245,19 +347,24 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
                         {formatDisplayDate(d)}
                       </span>
                       <div className="flex items-center gap-3 font-mono tabular-nums">
-                        {pending > 0 && (
-                          <span className="text-[11px] text-amber-700 dark:text-amber-400">
-                            {pending} pending
+                        {isRestricted && (
+                          <span className="text-[11px] font-semibold text-red-700 dark:text-red-400">
+                            Restricted
+                          </span>
+                        )}
+                        {breakdown.pendingCount > 0 && (
+                          <span className="text-[11px] text-blue-700 dark:text-blue-300">
+                            {breakdown.pendingCount} pending
                           </span>
                         )}
                         <span
                           className={`font-semibold ${
-                            blocked
+                            isCapFull
                               ? 'text-red-700 dark:text-red-400'
                               : 'text-emerald-700 dark:text-emerald-400'
                           }`}
                         >
-                          {used}/{cap} approved {blocked ? '(FULL)' : ''}
+                          {breakdown.occupiedCount}/{breakdown.maxCapacity} occupied {isCapFull ? '(FULL)' : ''}
                         </span>
                       </div>
                     </div>
@@ -289,6 +396,7 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
           {/* Blocking Validation Errors */}
           {(validation.errors.length > 0 && reason.length > 0) ||
           validation.unavailableDates.length > 0 ||
+          validation.blockedDates.length > 0 ||
           annualUsage.remainingPeriods === 0 ||
           submitError ? (
             <div
@@ -313,7 +421,10 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
               <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900/50 text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
                 <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
                 <span>
-                  All {validation.dates.length} day{validation.dates.length > 1 ? 's' : ''} verified within capacity. Pending requests do not reserve slots until approved.
+                  All {validation.dates.length} day{validation.dates.length > 1 ? 's' : ''} verified within capacity.{' '}
+                  {staff.countsTowardDailyCap
+                    ? 'Submitting immediately reserves daily slots while Pending.'
+                    : 'Executive, Officer, and Manager leave does not consume the 10-slot Assistant Officer & Attendant cap.'}
                 </span>
               </div>
             )
@@ -337,6 +448,13 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
           </div>
         </form>
       </div>
+
+      <LeaveRestrictedPopup
+        open={showRestrictedPopup}
+        blockedDates={validation.blockedDates}
+        matchedRestrictions={validation.matchedRestrictions}
+        onClose={() => setDismissedPopupSig(blockedSig)}
+      />
     </div>
   );
 };

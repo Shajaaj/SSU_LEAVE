@@ -4,18 +4,22 @@ import {
   CheckCircle2,
   Download,
   Search,
+  Trash2,
   XCircle,
 } from 'lucide-react';
 import {
   AppSettings,
   DailyCapacity,
+  DailyCapacityDetail,
   LeaveRequest,
   StaffProfile,
 } from '../types/portal';
 import { downloadCsv } from '../utils/csvExport';
+import { getLeaveBarStyle } from '../utils/leaveColors';
 import {
   calculateAnnualPeriodUsage,
   checkApprovalCapacityFeasibility,
+  getDailyCapacityBreakdown,
 } from '../utils/leaveRules';
 import {
   formatDisplayDate,
@@ -34,6 +38,7 @@ interface ManagementQueueViewProps {
   profiles: StaffProfile[];
   allRequests: LeaveRequest[];
   capacityMap: Record<string, DailyCapacity>;
+  capacityDetailsMap?: Record<string, DailyCapacityDetail>;
   settings: AppSettings;
   onApprove: (requestId: string, comment: string) => Promise<void>;
   onReject: (requestId: string, comment: string) => Promise<void>;
@@ -42,19 +47,26 @@ interface ManagementQueueViewProps {
     decision: 'approve_cancel' | 'approve_edit' | 'decline_modification',
     comment: string
   ) => Promise<void>;
+  onRemoveApproved?: (requestId: string) => Promise<void>;
 }
 
 export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
+  currentProfile,
   profiles,
   allRequests,
   capacityMap,
+  capacityDetailsMap,
   settings,
   onApprove,
   onReject,
   onProcessModification,
+  onRemoveApproved,
 }) => {
   const today = getTodayInMaldives();
   const maxCap = settings.maxDailyCombinedCap || 10;
+  const canRemoveApproved =
+    (currentProfile.role === 'executive' || currentProfile.role === 'manager') &&
+    Boolean(onRemoveApproved);
 
   const [decisionTarget, setDecisionTarget] = useState<{
     req: LeaveRequest;
@@ -63,6 +75,10 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
   const [comment, setComment] = useState('');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<LeaveRequest | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [queueStatusView, setQueueStatusView] = useState<'approved' | 'cancelled'>('approved');
+  const [approvedSearch, setApprovedSearch] = useState('');
 
   const activeStaffCount = useMemo(
     () => profiles.filter((p) => p.isActive).length,
@@ -101,7 +117,47 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
     [allRequests, today]
   );
 
-  const todayCapUsed = capacityMap[today]?.approvedCount || 0;
+  const approvedRequests = useMemo(
+    () =>
+      allRequests
+        .filter((r) => r.status === 'approved')
+        .sort((a, b) => a.startDate.localeCompare(b.startDate)),
+    [allRequests]
+  );
+
+  const cancelledRequests = useMemo(
+    () =>
+      allRequests
+        .filter((r) => r.status === 'cancelled')
+        .sort((a, b) => b.startDate.localeCompare(a.startDate)),
+    [allRequests]
+  );
+
+  const filteredQueueByStatus = useMemo(() => {
+    const base = queueStatusView === 'approved' ? approvedRequests : cancelledRequests;
+    const q = approvedSearch.trim().toLowerCase();
+    if (!q) return base;
+    return base.filter(
+      (r) =>
+        r.staffName.toLowerCase().includes(q) ||
+        r.staffId.toLowerCase().includes(q) ||
+        r.designation.toLowerCase().includes(q) ||
+        r.startDate.includes(q) ||
+        r.endDate.includes(q)
+    );
+  }, [queueStatusView, approvedRequests, cancelledRequests, approvedSearch]);
+
+  const todayBreakdown = useMemo(
+    () =>
+      getDailyCapacityBreakdown({
+        dateKey: today,
+        capacityMap,
+        capacityDetailsMap,
+        defaultMaxCap: maxCap,
+        pendingReservesCapacity: Boolean(settings.pendingReservesCapacity),
+      }),
+    [today, capacityMap, capacityDetailsMap, maxCap, settings.pendingReservesCapacity]
+  );
 
   const handleConfirmDecision = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -121,6 +177,20 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
       setComment('');
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleConfirmRemoveApproved = async () => {
+    if (!removeTarget || !onRemoveApproved) return;
+    setRemoveError(null);
+    setBusyId(removeTarget.requestId);
+    try {
+      await onRemoveApproved(removeTarget.requestId);
+      setRemoveTarget(null);
+    } catch (err) {
+      setRemoveError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyId(null);
     }
@@ -171,10 +241,10 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
             Daily Leave Capacity Today
           </p>
           <p className="text-2xl font-display font-bold font-mono tabular-nums text-teal-700 dark:text-teal-400">
-            {todayCapUsed} / {maxCap}
+            {todayBreakdown.occupiedCount} / {todayBreakdown.maxCapacity}
           </p>
           <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-            {Math.max(0, maxCap - todayCapUsed)} slots remaining
+            {todayBreakdown.availableSlots} left ({todayBreakdown.approvedOnlyCount} approved · {todayBreakdown.pendingCount} pending)
           </p>
         </div>
       </section>
@@ -187,7 +257,7 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
               Pending Leave Applications
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Approvals run inside an atomic Firestore transaction checking every date against the 10-slot combined daily limit.
+              Pending applications reserve slots upon submission. Approving keeps occupancy unchanged (no double-counting); rejecting releases slots immediately.
             </p>
           </div>
           <span className="text-xs font-mono font-semibold text-slate-600 dark:text-slate-300 tabular-nums">
@@ -205,42 +275,56 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
               const feasibility = checkApprovalCapacityFeasibility(
                 req,
                 capacityMap,
-                maxCap
+                maxCap,
+                capacityDetailsMap,
+                Boolean(settings.pendingReservesCapacity)
               );
+              const barStyle = getLeaveBarStyle(req.designation, req.status);
               return (
                 <div
                   key={req.requestId}
                   className="py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
                 >
-                  <div className="space-y-1.5 min-w-0">
-                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                      <span className="font-semibold text-sm text-slate-900 dark:text-white">
-                        {req.staffName}
-                      </span>
-                      <span className="font-mono text-slate-500 dark:text-slate-400">
-                        · {req.staffId} · {req.designation}
-                      </span>
-                    </div>
-                    <p className="text-xs text-slate-700 dark:text-slate-300 font-mono">
-                      {req.leaveType} · {formatDisplayDate(req.startDate)} –{' '}
-                      {formatDisplayDate(req.endDate)} ({req.daysCount} day
-                      {req.daysCount > 1 ? 's' : ''})
-                    </p>
-                    <p className="text-xs text-slate-600 dark:text-slate-400">
-                      {req.reason}
-                    </p>
-
-                    {!feasibility.feasible && (
-                      <p className="text-xs font-semibold text-red-700 dark:text-red-400 flex items-start gap-1.5 pt-0.5">
-                        <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" />
-                        <span>
-                          Blocked by daily cap on:{' '}
-                          {feasibility.fullDates
-                            .map((f) => `${formatDisplayDate(f.date)} (${f.approvedCount}/${f.maxCapacity})`)
-                            .join(', ')}
+                  <div className="flex items-stretch gap-3 min-w-0">
+                    <span
+                      className={`w-1.5 rounded-full border shrink-0 ${barStyle.barClass}`}
+                      aria-hidden="true"
+                    />
+                    <div className="space-y-1.5 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-semibold text-sm text-slate-900 dark:text-white">
+                          {req.staffName}
                         </span>
+                        <span className="font-mono text-slate-500 dark:text-slate-400">
+                          · {req.staffId} · {req.designation}
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded-[2px] text-[10px] font-semibold ${barStyle.badgeClass}`}
+                        >
+                          Pending
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-700 dark:text-slate-300 font-mono">
+                        {req.leaveType} · {formatDisplayDate(req.startDate)} –{' '}
+                        {formatDisplayDate(req.endDate)} ({req.daysCount} day
+                        {req.daysCount > 1 ? 's' : ''})
                       </p>
-                    )}
+                      <p className="text-xs text-slate-600 dark:text-slate-400">
+                        {req.reason}
+                      </p>
+
+                      {!feasibility.feasible && (
+                        <p className="text-xs font-semibold text-red-700 dark:text-red-400 flex items-start gap-1.5 pt-0.5">
+                          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" />
+                          <span>
+                            Blocked by daily cap on:{' '}
+                            {feasibility.fullDates
+                              .map((f) => `${formatDisplayDate(f.date)} (${f.approvedCount}/${f.maxCapacity})`)
+                              .join(', ')}
+                          </span>
+                        </p>
+                      )}
+                    </div>
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
@@ -352,12 +436,155 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                   >
                     Decline Change
                   </button>
+                  {canRemoveApproved && req.status === 'approved' && (
+                    <button
+                      type="button"
+                      disabled={busyId === req.requestId}
+                      onClick={() => {
+                        setRemoveError(null);
+                        setRemoveTarget(req);
+                      }}
+                      className="flex-1 sm:flex-initial min-h-[44px] sm:min-h-0 px-3 py-1.5 rounded-lg border border-red-300 dark:border-red-900/60 text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 text-xs font-semibold disabled:opacity-40 flex items-center justify-center gap-1.5 whitespace-nowrap"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>Remove Leave</span>
+                    </button>
+                  )}
                 </div>
               </div>
             ))}
           </div>
         </section>
       )}
+
+      {/* Approved & Cancelled Leave Applications Queue */}
+      <section className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-3">
+          <div>
+            <h2 className="text-base font-display font-bold text-[#0B1F3A] dark:text-white">
+              {queueStatusView === 'approved'
+                ? 'Approved Leave Applications'
+                : 'Cancelled Leave Applications'}
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              {queueStatusView === 'approved'
+                ? 'Active approved leave periods. Removing an approved leave marks it Cancelled and immediately releases occupied daily slots.'
+                : 'Removed or cancelled leave applications retained in history without occupying daily slots or annual leave periods.'}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-[#07111E] p-0.5 text-xs">
+              <button
+                type="button"
+                onClick={() => setQueueStatusView('approved')}
+                className={`px-3 py-1.5 rounded-md font-semibold transition-colors whitespace-nowrap ${
+                  queueStatusView === 'approved'
+                    ? 'bg-white dark:bg-[#0D1B2A] text-[#0B1F3A] dark:text-white shadow-xs'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
+                }`}
+              >
+                Approved ({approvedRequests.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setQueueStatusView('cancelled')}
+                className={`px-3 py-1.5 rounded-md font-semibold transition-colors whitespace-nowrap ${
+                  queueStatusView === 'cancelled'
+                    ? 'bg-white dark:bg-[#0D1B2A] text-[#0B1F3A] dark:text-white shadow-xs'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
+                }`}
+              >
+                Cancelled ({cancelledRequests.length})
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="relative max-w-sm">
+          <Search
+            className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2"
+            aria-hidden="true"
+          />
+          <input
+            type="text"
+            value={approvedSearch}
+            onChange={(e) => setApprovedSearch(e.target.value)}
+            placeholder="Search by Staff ID, name, or date..."
+            className="w-full pl-9 pr-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-sm text-slate-900 dark:text-slate-100"
+          />
+        </div>
+
+        {filteredQueueByStatus.length === 0 ? (
+          <p className="text-xs text-slate-500 dark:text-slate-400 py-6 text-center">
+            {queueStatusView === 'approved'
+              ? 'No approved leave applications match the current view.'
+              : 'No cancelled leave applications match the current view.'}
+          </p>
+        ) : (
+          <div className="divide-y divide-slate-100 dark:divide-slate-800">
+            {filteredQueueByStatus.map((req) => {
+              const barStyle = getLeaveBarStyle(req.designation, req.status);
+              return (
+                <div
+                  key={req.requestId}
+                  className="py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+                >
+                  <div className="flex items-stretch gap-3 min-w-0">
+                    <span
+                      className={`w-1.5 rounded-full border shrink-0 ${barStyle.barClass}`}
+                      aria-hidden="true"
+                    />
+                    <div className="space-y-1.5 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-semibold text-sm text-slate-900 dark:text-white">
+                          {req.staffName}
+                        </span>
+                        <span className="font-mono text-slate-500 dark:text-slate-400">
+                          · {req.staffId} · {req.designation}
+                        </span>
+                        <LeaveStatusLabel status={req.status} />
+                      </div>
+                      <p className="text-xs text-slate-700 dark:text-slate-300 font-mono">
+                        {req.leaveType} · {formatDisplayDate(req.startDate)} –{' '}
+                        {formatDisplayDate(req.endDate)} ({req.daysCount} day
+                        {req.daysCount > 1 ? 's' : ''})
+                      </p>
+                      {req.reason && (
+                        <p className="text-xs text-slate-600 dark:text-slate-400">
+                          {req.reason}
+                        </p>
+                      )}
+                      {req.reviewComment && (
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {req.reviewComment}
+                          {req.reviewedByName ? ` (${req.reviewedByName})` : ''}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  {canRemoveApproved && req.status === 'approved' && (
+                    <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
+                      <button
+                        type="button"
+                        disabled={busyId === req.requestId}
+                        onClick={() => {
+                          setRemoveError(null);
+                          setRemoveTarget(req);
+                        }}
+                        className="flex-1 sm:flex-initial min-h-[44px] sm:min-h-0 px-3.5 py-2 rounded-lg border border-red-300 dark:border-red-900/60 text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 text-xs font-semibold disabled:opacity-40 flex items-center justify-center gap-1.5 whitespace-nowrap"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>Remove Leave</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
       {/* Currently On Leave & Upcoming Approved Leave */}
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -371,21 +598,49 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
             </p>
           ) : (
             <div className="divide-y divide-slate-100 dark:divide-slate-800">
-              {onLeaveToday.map((r) => (
-                <div key={r.requestId} className="py-2.5 flex items-center justify-between text-xs gap-2">
-                  <div>
-                    <p className="font-semibold text-slate-900 dark:text-slate-100">
-                      {r.staffName} <span className="font-mono text-slate-500">· {r.staffId}</span>
-                    </p>
-                    <p className="text-slate-500 dark:text-slate-400">
-                      {r.designation} · {r.leaveType}
-                    </p>
+              {onLeaveToday.map((r) => {
+                const barStyle = getLeaveBarStyle(r.designation, r.status);
+                return (
+                  <div
+                    key={r.requestId}
+                    className="py-2.5 flex flex-wrap sm:flex-nowrap items-center justify-between text-xs gap-2"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span
+                        className={`w-1.5 h-7 rounded-full border shrink-0 ${barStyle.barClass}`}
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <p className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                          {r.staffName} <span className="font-mono text-slate-500">· {r.staffId}</span>
+                        </p>
+                        <p className="text-slate-500 dark:text-slate-400">
+                          {r.designation} · {r.leaveType}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0 ml-auto">
+                      <span className="font-mono text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                        Until {formatDisplayDate(r.endDate)}
+                      </span>
+                      {canRemoveApproved && r.status === 'approved' && (
+                        <button
+                          type="button"
+                          disabled={busyId === r.requestId}
+                          onClick={() => {
+                            setRemoveError(null);
+                            setRemoveTarget(r);
+                          }}
+                          className="min-h-[36px] sm:min-h-0 px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-900/60 text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 text-[11px] font-semibold disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"
+                        >
+                          <Trash2 className="w-3 h-3" aria-hidden="true" />
+                          <span>Remove Leave</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <span className="font-mono text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                    Until {formatDisplayDate(r.endDate)}
-                  </span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -400,21 +655,49 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
             </p>
           ) : (
             <div className="divide-y divide-slate-100 dark:divide-slate-800">
-              {upcomingApproved.slice(0, 8).map((r) => (
-                <div key={r.requestId} className="py-2.5 flex items-center justify-between text-xs gap-2">
-                  <div>
-                    <p className="font-semibold text-slate-900 dark:text-slate-100">
-                      {r.staffName} <span className="font-mono text-slate-500">· {r.staffId}</span>
-                    </p>
-                    <p className="text-slate-500 dark:text-slate-400">
-                      {r.designation} · {r.leaveType}
-                    </p>
+              {upcomingApproved.slice(0, 8).map((r) => {
+                const barStyle = getLeaveBarStyle(r.designation, r.status);
+                return (
+                  <div
+                    key={r.requestId}
+                    className="py-2.5 flex flex-wrap sm:flex-nowrap items-center justify-between text-xs gap-2"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <span
+                        className={`w-1.5 h-7 rounded-full border shrink-0 ${barStyle.barClass}`}
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <p className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                          {r.staffName} <span className="font-mono text-slate-500">· {r.staffId}</span>
+                        </p>
+                        <p className="text-slate-500 dark:text-slate-400">
+                          {r.designation} · {r.leaveType}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0 ml-auto">
+                      <span className="font-mono text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                        {formatDisplayDate(r.startDate)} – {formatDisplayDate(r.endDate)}
+                      </span>
+                      {canRemoveApproved && r.status === 'approved' && (
+                        <button
+                          type="button"
+                          disabled={busyId === r.requestId}
+                          onClick={() => {
+                            setRemoveError(null);
+                            setRemoveTarget(r);
+                          }}
+                          className="min-h-[36px] sm:min-h-0 px-2.5 py-1 rounded-lg border border-red-300 dark:border-red-900/60 text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 text-[11px] font-semibold disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"
+                        >
+                          <Trash2 className="w-3 h-3" aria-hidden="true" />
+                          <span>Remove Leave</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <span className="font-mono text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                    {formatDisplayDate(r.startDate)} – {formatDisplayDate(r.endDate)}
-                  </span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -501,6 +784,96 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Remove Approved Leave Confirmation Popup */}
+      {removeTarget && canRemoveApproved && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="remove-approved-leave-title"
+        >
+          <div className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-t-2xl sm:rounded-xl max-w-md w-full p-5 sm:p-6 space-y-4 shadow-xl max-h-[92vh] overflow-y-auto">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-lg bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900/60 flex items-center justify-center text-red-600 dark:text-red-400 shrink-0">
+                <Trash2 className="w-4 h-4" aria-hidden="true" />
+              </div>
+              <div className="space-y-1">
+                <h3
+                  id="remove-approved-leave-title"
+                  className="text-base font-display font-bold text-[#0B1F3A] dark:text-white"
+                >
+                  Remove Approved Leave
+                </h3>
+                <p className="text-xs font-medium text-red-700 dark:text-red-400">
+                  Are you sure you want to remove this approved leave?
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#07111E] p-3.5 space-y-2 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-500 dark:text-slate-400">Staff Name</span>
+                <span className="font-semibold text-slate-900 dark:text-white text-right">
+                  {removeTarget.staffName}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-500 dark:text-slate-400">Staff ID</span>
+                <span className="font-mono font-semibold text-slate-900 dark:text-white">
+                  {removeTarget.staffId}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-500 dark:text-slate-400">Leave Start Date</span>
+                <span className="font-mono font-semibold text-slate-900 dark:text-white">
+                  {formatDisplayDate(removeTarget.startDate)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-500 dark:text-slate-400">Leave End Date</span>
+                <span className="font-mono font-semibold text-slate-900 dark:text-white">
+                  {formatDisplayDate(removeTarget.endDate)}
+                </span>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+              Confirming removal will change this application status from Approved to{' '}
+              <strong className="text-slate-800 dark:text-slate-200">Cancelled</strong>,
+              immediately release all occupied daily leave slots for those dates, and retain the record in leave history under Cancelled.
+            </p>
+
+            {removeError && (
+              <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-700 dark:text-red-300">
+                {removeError}
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={busyId === removeTarget.requestId}
+                onClick={() => {
+                  setRemoveTarget(null);
+                  setRemoveError(null);
+                }}
+                className="min-h-[44px] sm:min-h-0 px-4 py-2 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={busyId === removeTarget.requestId}
+                onClick={handleConfirmRemoveApproved}
+                className="min-h-[44px] sm:min-h-0 px-4 py-2 text-xs font-semibold rounded-lg bg-red-600 hover:bg-red-700 text-white disabled:opacity-40 whitespace-nowrap"
+              >
+                {busyId === removeTarget.requestId ? 'Removing...' : 'Confirm Removal'}
+              </button>
+            </div>
           </div>
         </div>
       )}

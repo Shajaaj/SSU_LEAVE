@@ -14,6 +14,7 @@ import {
   DailyCapacityDetail,
   Designation,
   LeaveRequest,
+  LeaveRestriction,
   LeaveStatus,
   LeaveType,
   StaffProfile,
@@ -26,6 +27,13 @@ import {
   getMonthMetadata,
   getTodayInMaldives,
 } from '../utils/maldivesDate';
+import { getLeaveBarStyle } from '../utils/leaveColors';
+import { getActiveRestrictionsForDate } from '../utils/leaveRestrictions';
+import {
+  buildPendingDemandMap,
+  getDailyCapacityBreakdown,
+} from '../utils/leaveRules';
+import { LeaveColorLegend } from './StatusLabel';
 
 interface StaffDashboardProps {
   profile: StaffProfile;
@@ -34,6 +42,7 @@ interface StaffDashboardProps {
   capacityMap: Record<string, DailyCapacity>;
   capacityDetailsMap: Record<string, DailyCapacityDetail>;
   settings: AppSettings;
+  restrictions?: LeaveRestriction[];
   calendarYear: number;
   calendarMonth0: number;
   onChangeMonth: (y: number, m0: number) => void;
@@ -93,6 +102,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
   capacityMap,
   capacityDetailsMap,
   settings,
+  restrictions = [],
   calendarYear,
   calendarMonth0,
   onChangeMonth,
@@ -108,6 +118,11 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
   const [showAllUnitStaff, setShowAllUnitStaff] = useState(false);
   const [selectedSpan, setSelectedSpan] = useState<TimelineSpan | null>(null);
 
+  const pendingDemandMap = useMemo(
+    () => buildPendingDemandMap(allRequests),
+    [allRequests]
+  );
+
   const meta = useMemo(
     () => getMonthMetadata(calendarYear, calendarMonth0),
     [calendarYear, calendarMonth0]
@@ -118,12 +133,19 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
     [calendarYear, calendarMonth0]
   );
 
+  const isManagement =
+    profile.role === 'executive' || profile.role === 'manager';
+
   const dayColumns = useMemo(
     () =>
       monthDays.map((dateKey, idx) => {
         const [y, m, d] = dateKey.split('-').map(Number);
         const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
         const isWeekend = dow === 5 || dow === 6; // Maldives weekend: Fri & Sat
+        const myRestricted = getActiveRestrictionsForDate(dateKey, restrictions, profile);
+        const unitRestricted = isManagement
+          ? getActiveRestrictionsForDate(dateKey, restrictions)
+          : myRestricted;
         return {
           dateKey,
           dayStr: String(d).padStart(2, '0'),
@@ -131,9 +153,12 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
           colIndex: idx + 1,
           isToday: dateKey === todayMaldives,
           isWeekend,
+          isRestrictedForMe: myRestricted.length > 0,
+          hasAnyRestriction: unitRestricted.length > 0,
+          restrictionTooltip: unitRestricted.map((r) => r.reason).join(' / '),
         };
       }),
-    [monthDays, todayMaldives]
+    [monthDays, todayMaldives, restrictions, profile, isManagement]
   );
 
   const yearOptions = useMemo(() => {
@@ -223,8 +248,8 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
       });
     }
 
-    // 2. Fallback: merge any dailyCapacityDetails allocations not already represented
-    if (statusFilter !== 'pending') {
+    // 2. Fallback: merge any dailyCapacityDetails allocations (both Pending & Approved) not already represented
+    {
       const allocByReqStaff = new Map<
         string,
         {
@@ -233,6 +258,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
           staffName: string;
           designation: Designation;
           leaveType: LeaveType;
+          status: 'pending' | 'approved';
           days: number[];
         }
       >();
@@ -241,6 +267,11 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
         const dayNum = Number(dateKey.slice(8, 10));
         const allocs = capacityDetailsMap[dateKey]?.allocations || [];
         for (const a of allocs) {
+          const allocStatus: 'pending' | 'approved' =
+            a.status === 'pending' ? 'pending' : 'approved';
+          if (statusFilter === 'approved' && allocStatus !== 'approved') continue;
+          if (statusFilter === 'pending' && allocStatus !== 'pending') continue;
+
           const seen = seenRequestIds.get(a.staffId);
           if (seen && seen.has(a.requestId)) continue;
           const groupKey = `${a.staffId}::${a.requestId}`;
@@ -252,6 +283,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
               staffName: a.staffName,
               designation: a.designation,
               leaveType: a.leaveType,
+              status: allocStatus,
               days: [],
             };
             allocByReqStaff.set(groupKey, g);
@@ -273,7 +305,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
           staffName: g.staffName,
           designation: g.designation,
           leaveType: g.leaveType,
-          status: 'approved',
+          status: g.status,
           hasModPending: false,
           startDate: `${monthPrefix}${String(startDay).padStart(2, '0')}`,
           endDate: `${monthPrefix}${String(endDay).padStart(2, '0')}`,
@@ -507,22 +539,15 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
               {showAllUnitStaff ? 'All Unit Staff' : 'On Leave Only'}
             </button>
           )}
-
-          <div className="hidden xl:flex items-center gap-3 text-[11px] text-slate-600 dark:text-slate-400 pl-1">
-            <span className="flex items-center gap-1.5 whitespace-nowrap">
-              <span className="w-3 h-2.5 rounded-xs bg-[#9CD3A4] dark:bg-emerald-500/45 border border-emerald-600/50 inline-block" />
-              Approved
-            </span>
-            <span className="flex items-center gap-1.5 whitespace-nowrap">
-              <span className="w-3 h-2.5 rounded-xs bg-[#F5D7A1] dark:bg-amber-500/45 border border-amber-600/50 inline-block" />
-              Pending
-            </span>
-            <span className="flex items-center gap-1.5 whitespace-nowrap">
-              <span className="w-3 h-2.5 rounded-xs bg-[#D8DADF] dark:bg-slate-600 border border-slate-500/50 inline-block" />
-              Mod Pending
-            </span>
-          </div>
         </div>
+      </div>
+
+      {/* Designation & Status Colour Legend (visible across desktop, tablet & mobile) */}
+      <div className="shrink-0 flex flex-wrap items-center justify-between gap-2 px-0.5">
+        <LeaveColorLegend />
+        <span className="text-[11px] text-slate-500 dark:text-slate-400">
+          Pending &amp; Approved Assistant Officer / Attendant leave count toward Daily Cap ({maxCap}/day).
+        </span>
       </div>
 
       {/* Full-Month Horizontal Staff Timeline Matrix (Mobile, Tablet & Desktop) */}
@@ -548,18 +573,30 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
                     key={col.dateKey}
                     type="button"
                     onClick={() => onOpenNewRequest(col.dateKey, col.dateKey)}
-                    title={`Request leave starting ${formatDisplayDate(col.dateKey)}`}
+                    title={
+                      col.hasAnyRestriction
+                        ? `Restricted: ${col.restrictionTooltip}`
+                        : `Request leave starting ${formatDisplayDate(col.dateKey)}`
+                    }
                     className={`py-1 px-0 text-center border-r last:border-r-0 border-slate-300/70 dark:border-slate-700/70 flex flex-col items-center justify-center transition-colors hover:bg-white/60 dark:hover:bg-white/10 ${
                       col.isToday
                         ? 'bg-teal-600 text-white'
-                        : col.isWeekend
-                          ? 'bg-slate-200/60 dark:bg-slate-900/50 text-slate-700 dark:text-slate-300'
-                          : 'text-[#0B1F3A] dark:text-slate-200'
+                        : col.isRestrictedForMe
+                          ? 'bg-rose-100/90 dark:bg-rose-950/70 text-rose-800 dark:text-rose-200'
+                          : col.hasAnyRestriction
+                            ? 'bg-amber-100/80 dark:bg-amber-950/50 text-amber-900 dark:text-amber-200'
+                            : col.isWeekend
+                              ? 'bg-slate-200/60 dark:bg-slate-900/50 text-slate-700 dark:text-slate-300'
+                              : 'text-[#0B1F3A] dark:text-slate-200'
                     }`}
                   >
                     <span
                       className={`text-[8.5px] xl:text-[9.5px] leading-tight font-medium ${
-                        col.isToday ? 'text-teal-100' : 'text-slate-500 dark:text-slate-400'
+                        col.isToday
+                          ? 'text-teal-100'
+                          : col.isRestrictedForMe
+                            ? 'text-rose-700 dark:text-rose-300'
+                            : 'text-slate-500 dark:text-slate-400'
                       }`}
                     >
                       {col.weekday}
@@ -656,45 +693,57 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
                           className={`h-full border-r last:border-r-0 border-slate-300/75 dark:border-slate-800/90 transition-colors hover:bg-teal-500/10 ${
                             col.isToday
                               ? 'bg-teal-500/8'
-                              : col.isWeekend
-                                ? 'bg-slate-200/35 dark:bg-slate-900/35'
-                                : ''
+                              : col.isRestrictedForMe
+                                ? 'bg-rose-500/10 dark:bg-rose-950/25'
+                                : col.hasAnyRestriction
+                                  ? 'bg-amber-500/8 dark:bg-amber-950/15'
+                                  : col.isWeekend
+                                    ? 'bg-slate-200/35 dark:bg-slate-900/35'
+                                    : ''
                           }`}
                         />
                       ))}
 
                       {/* Contiguous Horizontal Leave Bars */}
                       {row.spans.map((span) => {
-                        const barColors = span.hasModPending
-                          ? 'bg-[#D8DADF] dark:bg-slate-600/80 border-[#8C929C] dark:border-slate-400 text-slate-900 dark:text-slate-100'
-                          : span.status === 'pending'
-                            ? 'bg-[#F5D7A1] dark:bg-amber-500/35 border-[#C49A45] dark:border-amber-400/70 text-amber-950 dark:text-amber-100'
-                            : 'bg-[#9CD3A4] dark:bg-emerald-500/35 border-[#5B9A65] dark:border-emerald-400/70 text-emerald-950 dark:text-emerald-100';
+                        const barStyle = getLeaveBarStyle(
+                          span.designation,
+                          span.status,
+                          span.hasModPending
+                        );
 
                         return (
                           <button
                             key={span.key}
                             type="button"
                             onClick={() => setSelectedSpan(span)}
-                            title={`${span.staffName} (${span.staffId}) · ${span.leaveType} · ${formatDisplayDate(span.startDate)} – ${formatDisplayDate(span.endDate)} (${span.status})`}
+                            title={`${span.staffName} (${span.staffId} · ${span.designation}) · ${span.leaveType} · ${formatDisplayDate(span.startDate)} – ${formatDisplayDate(span.endDate)} (${barStyle.statusText})`}
                             style={{
                               gridColumnStart: span.startCol,
                               gridColumnEnd: span.endCol + 1,
                               gridRowStart: span.lane,
                             }}
-                            className={`relative z-10 my-[4px] mx-[1px] h-[24px] rounded-[2px] border px-1.5 flex items-center justify-between gap-1 text-[10px] font-medium overflow-hidden transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0B1F3A] dark:focus-visible:ring-teal-400 ${barColors}`}
+                            className={`relative z-10 my-[4px] mx-[1px] h-[24px] rounded-[2px] border px-1.5 flex items-center justify-between gap-1 text-[10px] font-semibold overflow-hidden transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0B1F3A] dark:focus-visible:ring-teal-400 ${barStyle.barClass}`}
                           >
-                            {span.spanDays >= 3 && (
-                              <span className="truncate leading-none">
-                                {span.status === 'pending'
-                                  ? 'Pending'
-                                  : span.hasModPending
-                                    ? 'Mod Pending'
-                                    : span.leaveType}
-                              </span>
+                            {span.status === 'pending' ? (
+                              span.spanDays >= 2 ? (
+                                <span className="truncate leading-none">
+                                  Pending
+                                </span>
+                              ) : (
+                                <span className="leading-none text-[9px] font-bold">
+                                  P
+                                </span>
+                              )
+                            ) : (
+                              span.spanDays >= 3 && (
+                                <span className="truncate leading-none">
+                                  {span.hasModPending ? 'Mod Pending' : span.leaveType}
+                                </span>
+                              )
                             )}
                             {span.spanDays >= 5 && (
-                              <span className="shrink-0 font-mono text-[9px] opacity-80">
+                              <span className="shrink-0 font-mono text-[9px] opacity-85">
                                 {span.spanDays}d
                               </span>
                             )}
@@ -722,13 +771,21 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
                 }}
               >
                 {dayColumns.map((col) => {
-                  const used = capacityMap[col.dateKey]?.approvedCount || 0;
-                  const limit = capacityMap[col.dateKey]?.maxCapacity || maxCap;
-                  const isFull = used >= limit;
+                  const breakdown = getDailyCapacityBreakdown({
+                    dateKey: col.dateKey,
+                    capacityMap,
+                    pendingDemandMap,
+                    capacityDetailsMap,
+                    defaultMaxCap: maxCap,
+                    pendingReservesCapacity: Boolean(settings.pendingReservesCapacity),
+                  });
+                  const used = breakdown.occupiedCount;
+                  const limit = breakdown.maxCapacity;
+                  const isFull = breakdown.isFull;
                   return (
                     <div
                       key={col.dateKey}
-                      title={`${formatDisplayDate(col.dateKey)}: ${used}/${limit} cap slots used`}
+                      title={`${formatDisplayDate(col.dateKey)}: ${used}/${limit} slots occupied (${breakdown.approvedOnlyCount} approved, ${breakdown.pendingCount} pending)`}
                       className={`py-1 text-center text-[10px] font-mono tabular-nums font-bold border-r last:border-r-0 border-slate-300/70 dark:border-slate-700/70 ${
                         isFull
                           ? 'bg-red-100 dark:bg-red-950/60 text-red-700 dark:text-red-300'

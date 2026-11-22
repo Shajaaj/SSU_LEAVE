@@ -78,7 +78,9 @@ export interface LeaveRequest {
 
 export interface DailyCapacity {
   date: string; // YYYY-MM-DD
-  approvedCount: number;
+  approvedCount: number; // Combined occupied cap slots (Pending + Approved for Assistant Officers & Attendants)
+  approvedOnlyCount?: number;
+  pendingCount?: number;
   maxCapacity: number;
   updatedAt?: unknown;
 }
@@ -89,6 +91,7 @@ export interface DailyAllocationEntry {
   designation: Designation;
   requestId: string;
   leaveType: LeaveType;
+  status?: LeaveStatus;
 }
 
 export interface DailyCapacityDetail {
@@ -103,6 +106,9 @@ export type AuditAction =
   | 'LEAVE_REJECTED'
   | 'LEAVE_CANCELLED'
   | 'LEAVE_MODIFIED'
+  | 'LEAVE_DATA_CLEARED'
+  | 'RESTRICTION_SAVED'
+  | 'RESTRICTION_REMOVED'
   | 'MOD_REQUESTED'
   | 'STAFF_PROVISIONED'
   | 'STAFF_IMPORTED'
@@ -116,7 +122,7 @@ export type AuditAction =
 export interface AuditLog {
   logId: string;
   action: AuditAction;
-  targetType: 'leaveRequest' | 'staff' | 'appSettings';
+  targetType: 'leaveRequest' | 'staff' | 'appSettings' | 'leaveRestriction';
   targetId: string;
   actorStaffId: string;
   actorName: string;
@@ -126,6 +132,29 @@ export interface AuditLog {
   newStatus?: string;
   affectedDates?: string[];
   createdAt?: unknown;
+}
+
+export type RestrictionTargetType =
+  | 'all'
+  | 'assistant_officer'
+  | 'attendant'
+  | 'executive'
+  | 'officer'
+  | 'selected_staff';
+
+export interface LeaveRestriction {
+  restrictionId: string;
+  startDate: string; // YYYY-MM-DD
+  endDate: string; // YYYY-MM-DD
+  targetType: RestrictionTargetType;
+  targetStaffIds: string[];
+  targetStaffNames?: string[];
+  reason: string;
+  isActive: boolean;
+  createdByStaffId: string;
+  createdByName: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
 }
 
 export interface AppSettings {

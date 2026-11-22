@@ -202,7 +202,7 @@ async function cmdImport(args: string[]) {
     await settingsRef.set({
       maxDailyCombinedCap: 10,
       maxAnnualLeavePeriods: 3,
-      pendingReservesCapacity: false,
+      pendingReservesCapacity: true,
       timezone: 'Asia/Male',
       unitName: 'Special Services Unit',
       airportName: 'Velana International Airport',

@@ -15,7 +15,6 @@ import {
   onSnapshot,
   orderBy,
   query,
-  runTransaction,
   serverTimestamp,
   where,
   writeBatch,
@@ -28,12 +27,15 @@ import {
   DailyCapacityDetail,
   Designation,
   LeaveRequest,
+  LeaveRestriction,
   LeaveType,
+  RestrictionTargetType,
   StaffAuthLink,
   StaffProfile,
   UserRole,
 } from '../types/portal';
 import { expandDateRange, getMonthMetadata } from '../utils/maldivesDate';
+import { findRestrictedDatesForStaff, formatLongDate } from '../utils/leaveRestrictions';
 import { isValidPinFormat, isValidStaffIdFormat } from '../utils/staffAuthId';
 
 const REMEMBERED_STAFF_ID_KEY = 'ssu_remembered_staff_id';
@@ -41,7 +43,7 @@ const REMEMBERED_STAFF_ID_KEY = 'ssu_remembered_staff_id';
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   maxDailyCombinedCap: 10,
   maxAnnualLeavePeriods: 3,
-  pendingReservesCapacity: false,
+  pendingReservesCapacity: true,
   timezone: 'Asia/Male',
   unitName: 'Special Services Unit',
   airportName: 'Velana International Airport',
@@ -129,6 +131,33 @@ async function postWorkerJson<T>(
     throw new Error(
       'PIN authentication Worker endpoint (/api/*) is unavailable. Deploy or run with Cloudflare Workers.'
     );
+  }
+
+  const data = (await response.json()) as T & { error?: string };
+  if (!response.ok) {
+    throw new Error(data?.error || `Request failed (${response.status}).`);
+  }
+  return data;
+}
+
+async function getWorkerJson<T>(path: string, bearerToken: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${bearerToken}`,
+      },
+    });
+  } catch {
+    throw new Error(
+      'Unable to reach the server. Check your internet connection and try again.'
+    );
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    throw new Error('Worker endpoint (/api/*) is unavailable.');
   }
 
   const data = (await response.json()) as T & { error?: string };
@@ -554,9 +583,119 @@ export function subscribeAuditLogs(
   );
 }
 
+export async function fetchLeaveRestrictionsFromWorker(): Promise<LeaveRestriction[]> {
+  const user = auth.currentUser;
+  if (!user) return [];
+  const idToken = await user.getIdToken();
+  const res = await getWorkerJson<{ ok: boolean; restrictions: LeaveRestriction[] }>(
+    '/api/leave/restrictions',
+    idToken
+  );
+  return Array.isArray(res.restrictions) ? res.restrictions : [];
+}
+
+export function subscribeLeaveRestrictions(
+  onData: (restrictions: LeaveRestriction[]) => void,
+  onFallbackLoad?: () => void
+): Unsubscribe {
+  let active = true;
+  return onSnapshot(
+    collection(db, 'leaveRestrictions'),
+    (snap) => {
+      if (!active) return;
+      const items = snap.docs
+        .map((d) => {
+          const raw = d.data() as Partial<LeaveRestriction>;
+          return {
+            restrictionId: String(raw.restrictionId || d.id),
+            startDate: String(raw.startDate || ''),
+            endDate: String(raw.endDate || ''),
+            targetType: (raw.targetType as RestrictionTargetType) || 'all',
+            targetStaffIds: Array.isArray(raw.targetStaffIds) ? raw.targetStaffIds : [],
+            targetStaffNames: Array.isArray(raw.targetStaffNames) ? raw.targetStaffNames : [],
+            reason: String(raw.reason || ''),
+            isActive: raw.isActive !== false,
+            createdByStaffId: String(raw.createdByStaffId || ''),
+            createdByName: String(raw.createdByName || ''),
+            createdAt: raw.createdAt,
+            updatedAt: raw.updatedAt,
+          } satisfies LeaveRestriction;
+        })
+        .filter((r) => Boolean(r.startDate && r.endDate))
+        .sort((a, b) => b.startDate.localeCompare(a.startDate));
+      onData(items);
+    },
+    () => {
+      // Fallback gracefully via Cloudflare Worker when Firestore security rules are pending update
+      void fetchLeaveRestrictionsFromWorker()
+        .then((items) => {
+          if (active) {
+            onData(items);
+            onFallbackLoad?.();
+          }
+        })
+        .catch(() => undefined);
+    }
+  );
+}
+
 /* -------------------------------------------------------------------------- */
-/* Leave & Administrative Transactions                                        */
+/* Leave & Administrative Transactions (Cloudflare Worker Atomic Sync)        */
 /* -------------------------------------------------------------------------- */
+
+export async function syncPendingCapacity(force = false): Promise<{
+  syncedDates: number;
+  activeRequests: number;
+}> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
+  }
+  const idToken = await user.getIdToken();
+  const res = await postWorkerJson<{
+    ok: boolean;
+    syncedDates: number;
+    activeRequests: number;
+  }>('/api/leave/sync-pending-capacity', { force }, idToken);
+  return {
+    syncedDates: Number(res.syncedDates || 0),
+    activeRequests: Number(res.activeRequests || 0),
+  };
+}
+
+export async function fetchCapacityForDates(dates: string[]): Promise<{
+  capacityMap: Record<string, DailyCapacity>;
+  capacityDetailsMap: Record<string, DailyCapacityDetail>;
+}> {
+  const uniqueDates = Array.from(new Set(dates.filter(Boolean)));
+  if (uniqueDates.length === 0) {
+    return { capacityMap: {}, capacityDetailsMap: {} };
+  }
+
+  const [capSnaps, detailSnaps] = await Promise.all([
+    Promise.all(uniqueDates.map((d) => getDoc(doc(db, 'dailyCapacity', d)))),
+    Promise.all(uniqueDates.map((d) => getDoc(doc(db, 'dailyCapacityDetails', d)))),
+  ]);
+
+  const capacityMap: Record<string, DailyCapacity> = {};
+  const capacityDetailsMap: Record<string, DailyCapacityDetail> = {};
+
+  capSnaps.forEach((snap, idx) => {
+    if (snap.exists()) {
+      const data = snap.data() as DailyCapacity;
+      capacityMap[data.date || uniqueDates[idx]] = data;
+    }
+  });
+
+  detailSnaps.forEach((snap, idx) => {
+    if (snap.exists()) {
+      const data = snap.data() as DailyCapacityDetail;
+      capacityDetailsMap[data.date || uniqueDates[idx]] = data;
+    }
+  });
+
+  return { capacityMap, capacityDetailsMap };
+}
 
 export async function submitLeaveRequest(
   staff: StaffProfile,
@@ -567,9 +706,12 @@ export async function submitLeaveRequest(
     reason: string;
   }
 ): Promise<{ requestId: string }> {
-  const uid = auth.currentUser?.uid;
-  if (!uid) {
+  const user = auth.currentUser;
+  if (!user) {
     throw new Error('Authentication required. Please log in again.');
+  }
+  if (!staff.isActive) {
+    throw new Error('Your staff account is inactive. Contact a Manager.');
   }
   if (payload.leaveType !== 'Annual Leave') {
     throw new Error('Only Annual Leave applications are permitted.');
@@ -583,144 +725,36 @@ export async function submitLeaveRequest(
   if (expanded.error) {
     throw new Error(expanded.error);
   }
-  const dates = expanded.dates;
-  const calendarYear = Number(payload.startDate.slice(0, 4));
 
-  const settingsSnap = await getDoc(doc(db, 'appSettings', 'portalConfig'));
-  const settings = settingsSnap.exists()
-    ? ({ ...DEFAULT_APP_SETTINGS, ...settingsSnap.data() } as AppSettings)
-    : DEFAULT_APP_SETTINGS;
-
-  const maxCap = settings.maxDailyCombinedCap || 10;
-  const annualLimit = staff.annualPeriodLimit || settings.maxAnnualLeavePeriods || 3;
-
-  const userReqsSnap = await getDocs(
-    query(collection(db, 'leaveRequests'), where('staffId', '==', staff.staffId))
+  const idToken = await user.getIdToken(true);
+  const res = await postWorkerJson<{ ok: boolean; requestId: string }>(
+    '/api/leave/submit',
+    {
+      leaveType: payload.leaveType,
+      startDate: payload.startDate,
+      endDate: payload.endDate,
+      reason: trimmedReason,
+    },
+    idToken
   );
-  const userReqs = userReqsSnap.docs.map((d) => d.data() as LeaveRequest);
 
-  const yearAllocated = userReqs.filter(
-    (r) =>
-      r.calendarYear === calendarYear &&
-      (r.status === 'approved' || r.status === 'pending')
-  );
-  if (yearAllocated.length >= annualLimit) {
-    throw new Error(
-      `Annual limit reached for ${calendarYear}: ${yearAllocated.length}/${annualLimit} leave periods used or pending.`
-    );
-  }
-
-  const bookedDates = new Set<string>();
-  for (const r of userReqs) {
-    if (r.status === 'approved' || r.status === 'pending') {
-      for (const d of r.dates) bookedDates.add(d);
-    }
-  }
-  const overlapping = dates.filter((d) => bookedDates.has(d));
-  if (overlapping.length > 0) {
-    throw new Error(
-      `You already have pending or approved leave on: ${overlapping.join(', ')}.`
-    );
-  }
-
-  if (staff.countsTowardDailyCap) {
-    const capSnaps = await Promise.all(
-      dates.map((d) => getDoc(doc(db, 'dailyCapacity', d)))
-    );
-    const fullDates: string[] = [];
-    capSnaps.forEach((snap, idx) => {
-      const used = snap.exists() ? Number(snap.data()?.approvedCount || 0) : 0;
-      const capLimit = snap.exists() ? Number(snap.data()?.maxCapacity || maxCap) : maxCap;
-      if (used >= capLimit) {
-        fullDates.push(`${dates[idx]} (${used}/${capLimit})`);
-      }
-    });
-    if (fullDates.length > 0) {
-      throw new Error(
-        `Daily limit (${maxCap} combined Assistant Officers & Attendants) is full on: ${fullDates.join(', ')}.`
-      );
-    }
-  }
-
-  const requestId = makeClientId('req');
-  const logId = makeClientId('log');
-  const batch = writeBatch(db);
-
-  batch.set(doc(db, 'leaveRequests', requestId), {
-    requestId,
-    uid,
-    staffId: staff.staffId,
-    staffName: staff.fullName,
-    designation: staff.designation,
-    countsTowardDailyCap: Boolean(staff.countsTowardDailyCap),
-    leaveType: 'Annual Leave',
-    startDate: payload.startDate,
-    endDate: payload.endDate,
-    dates,
-    daysCount: dates.length,
-    calendarYear,
-    reason: trimmedReason,
-    status: 'pending',
-    modificationRequestType: 'none',
-    lastAuditLogId: logId,
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-
-  batch.set(doc(db, 'auditLogs', logId), {
-    logId,
-    action: 'LEAVE_SUBMITTED',
-    targetType: 'leaveRequest',
-    targetId: requestId,
-    actorStaffId: staff.staffId,
-    actorName: staff.fullName,
-    actorRole: staff.role,
-    summary: `Submitted Annual Leave (${payload.startDate} – ${payload.endDate}, ${dates.length} day${dates.length > 1 ? 's' : ''}).`,
-    newStatus: 'pending',
-    affectedDates: dates,
-    createdAt: serverTimestamp(),
-  });
-
-  try {
-    await batch.commit();
-  } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `leaveRequests/${requestId}`);
-  }
-
-  return { requestId };
+  return { requestId: res.requestId };
 }
 
 export async function cancelPendingLeaveRequest(
-  staff: StaffProfile,
+  _staff: StaffProfile,
   req: LeaveRequest
 ): Promise<void> {
-  const logId = makeClientId('log');
-  const batch = writeBatch(db);
-  batch.update(doc(db, 'leaveRequests', req.requestId), {
-    status: 'cancelled',
-    lastAuditLogId: logId,
-    updatedAt: serverTimestamp(),
-  });
-  batch.set(doc(db, 'auditLogs', logId), {
-    logId,
-    action: 'LEAVE_CANCELLED',
-    targetType: 'leaveRequest',
-    targetId: req.requestId,
-    actorStaffId: staff.staffId,
-    actorName: staff.fullName,
-    actorRole: staff.role,
-    summary: `Applicant cancelled pending ${req.leaveType} (${req.startDate} – ${req.endDate}).`,
-    previousStatus: 'pending',
-    newStatus: 'cancelled',
-    affectedDates: req.dates.slice(0, 31),
-    createdAt: serverTimestamp(),
-  });
-
-  try {
-    await batch.commit();
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `leaveRequests/${req.requestId}`);
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
   }
+  const idToken = await user.getIdToken(true);
+  await postWorkerJson<{ ok: boolean; requestId: string }>(
+    '/api/leave/cancel-pending',
+    { requestId: req.requestId },
+    idToken
+  );
 }
 
 export async function requestLeaveModification(
@@ -743,6 +777,69 @@ export async function requestLeaveModification(
       30
     );
     if (exp.error) throw new Error(exp.error);
+
+    // Prevent overlapping another pending or approved leave period
+    const userReqsSnap = await getDocs(
+      query(collection(db, 'leaveRequests'), where('staffId', '==', staff.staffId))
+    );
+    const otherBooked = new Set<string>();
+    for (const d of userReqsSnap.docs) {
+      const item = d.data() as LeaveRequest;
+      if (
+        item.requestId !== req.requestId &&
+        (item.status === 'pending' || item.status === 'approved')
+      ) {
+        for (const dt of item.dates || []) otherBooked.add(dt);
+      }
+    }
+    const overlaps = exp.dates.filter((d) => otherBooked.has(d));
+    if (overlaps.length > 0) {
+      throw new Error(
+        `Requested dates overlap another pending or approved leave on: ${overlaps.join(', ')}.`
+      );
+    }
+
+    const activeRestrictions = await fetchLeaveRestrictionsFromWorker().catch(() => []);
+    const blockedCheck = findRestrictedDatesForStaff(
+      exp.dates,
+      activeRestrictions,
+      staff
+    );
+    if (blockedCheck.matchedRestrictions.length > 0) {
+      const primary = blockedCheck.matchedRestrictions[0];
+      throw new Error(
+        `Leave applications are not permitted from ${formatLongDate(primary.startDate)} to ${formatLongDate(primary.endDate)}. Reason: ${primary.reason}. Please select alternative dates.`
+      );
+    }
+
+    // Verify daily capacity on newly added dates for cap-counting designations
+    if (staff.countsTowardDailyCap) {
+      const oldDates = new Set(req.dates || []);
+      const addedDates = exp.dates.filter((d) => !oldDates.has(d));
+      if (addedDates.length > 0) {
+        const [settingsSnap, fetched] = await Promise.all([
+          getDoc(doc(db, 'appSettings', 'portalConfig')),
+          fetchCapacityForDates(addedDates),
+        ]);
+        const maxCap = settingsSnap.exists()
+          ? Number(settingsSnap.data()?.maxDailyCombinedCap || 10)
+          : 10;
+        const fullDates: string[] = [];
+        for (const dateKey of addedDates) {
+          const cap = fetched.capacityMap[dateKey];
+          const used = cap ? Number(cap.approvedCount || 0) : 0;
+          const capLimit = cap ? Number(cap.maxCapacity || maxCap) : maxCap;
+          if (used >= capLimit) {
+            fullDates.push(`${dateKey} (${used}/${capLimit})`);
+          }
+        }
+        if (fullDates.length > 0) {
+          throw new Error(
+            `Daily capacity (${maxCap} slots including Pending & Approved) is full on: ${fullDates.join(', ')}.`
+          );
+        }
+      }
+    }
   }
 
   const logId = makeClientId('log');
@@ -781,380 +878,80 @@ export async function requestLeaveModification(
 }
 
 export async function approveLeaveRequest(
-  reviewer: StaffProfile,
+  _reviewer: StaffProfile,
   requestId: string,
   comment: string,
-  settings: AppSettings
+  _settings: AppSettings
 ): Promise<void> {
-  const reqRef = doc(db, 'leaveRequests', requestId);
-  const logId = makeClientId('log');
-  const defaultMaxCap = Math.min(10, Math.max(1, settings.maxDailyCombinedCap || 10));
-
-  try {
-    await runTransaction(db, async (tx) => {
-      const reqSnap = await tx.get(reqRef);
-      if (!reqSnap.exists()) {
-        throw new Error('Leave request not found.');
-      }
-      const reqData = reqSnap.data() as LeaveRequest;
-      if (reqData.status !== 'pending') {
-        throw new Error(`Cannot approve: request status is already "${reqData.status}".`);
-      }
-
-      const capRefs = reqData.dates.map((d) => doc(db, 'dailyCapacity', d));
-      const detailRefs = reqData.dates.map((d) => doc(db, 'dailyCapacityDetails', d));
-      const capSnaps = await Promise.all(capRefs.map((r) => tx.get(r)));
-      const detailSnaps = await Promise.all(detailRefs.map((r) => tx.get(r)));
-
-      const fullDates: string[] = [];
-      if (reqData.countsTowardDailyCap) {
-        reqData.dates.forEach((dateKey, idx) => {
-          const snap = capSnaps[idx];
-          const used = snap.exists() ? Number(snap.data()?.approvedCount || 0) : 0;
-          const capLimit = snap.exists()
-            ? Number(snap.data()?.maxCapacity || defaultMaxCap)
-            : defaultMaxCap;
-          if (used + 1 > capLimit) {
-            fullDates.push(`${dateKey} (${used}/${capLimit})`);
-          }
-        });
-      }
-
-      if (fullDates.length > 0) {
-        throw new Error(
-          `Approval blocked — daily limit reached on: ${fullDates.join(', ')}.`
-        );
-      }
-
-      reqData.dates.forEach((dateKey, idx) => {
-        const capSnap = capSnaps[idx];
-        const detailSnap = detailSnaps[idx];
-        const used = capSnap.exists() ? Number(capSnap.data()?.approvedCount || 0) : 0;
-        const capLimit = capSnap.exists()
-          ? Number(capSnap.data()?.maxCapacity || defaultMaxCap)
-          : defaultMaxCap;
-
-        if (reqData.countsTowardDailyCap) {
-          tx.set(capRefs[idx], {
-            date: dateKey,
-            approvedCount: used + 1,
-            maxCapacity: Math.min(10, capLimit),
-            updatedAt: serverTimestamp(),
-          });
-        }
-
-        const existingAllocs = (
-          detailSnap.exists() ? detailSnap.data()?.allocations || [] : []
-        ) as Array<Record<string, unknown>>;
-        const filtered = existingAllocs.filter(
-          (a) => a.requestId !== reqData.requestId
-        );
-        filtered.push({
-          staffId: reqData.staffId,
-          staffName: reqData.staffName,
-          designation: reqData.designation,
-          requestId: reqData.requestId,
-          leaveType: reqData.leaveType,
-        });
-        tx.set(detailRefs[idx], {
-          date: dateKey,
-          allocations: filtered.slice(0, 25),
-          updatedAt: serverTimestamp(),
-        });
-      });
-
-      tx.update(reqRef, {
-        status: 'approved',
-        reviewedByStaffId: reviewer.staffId,
-        reviewedByName: reviewer.fullName,
-        reviewComment: comment.trim() || 'Approved within operational capacity.',
-        lastAuditLogId: logId,
-        updatedAt: serverTimestamp(),
-      });
-
-      tx.set(doc(db, 'auditLogs', logId), {
-        logId,
-        action: 'LEAVE_APPROVED',
-        targetType: 'leaveRequest',
-        targetId: reqData.requestId,
-        actorStaffId: reviewer.staffId,
-        actorName: reviewer.fullName,
-        actorRole: reviewer.role,
-        summary: `Approved ${reqData.staffName} (${reqData.staffId}) ${reqData.leaveType} for ${reqData.startDate} – ${reqData.endDate}.`,
-        previousStatus: 'pending',
-        newStatus: 'approved',
-        affectedDates: reqData.dates.slice(0, 31),
-        createdAt: serverTimestamp(),
-      });
-    });
-  } catch (err) {
-    if (
-      err instanceof Error &&
-      (err.message.startsWith('Approval blocked') ||
-        err.message.startsWith('Cannot approve') ||
-        err.message === 'Leave request not found.')
-    ) {
-      throw err;
-    }
-    handleFirestoreError(err, OperationType.WRITE, `leaveRequests/${requestId}`);
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
   }
+  const idToken = await user.getIdToken(true);
+  await postWorkerJson<{ ok: boolean; requestId: string }>(
+    '/api/leave/approve',
+    {
+      requestId,
+      comment: comment.trim(),
+    },
+    idToken
+  );
 }
 
 export async function rejectLeaveRequest(
-  reviewer: StaffProfile,
+  _reviewer: StaffProfile,
   requestId: string,
   comment: string
 ): Promise<void> {
-  const reqRef = doc(db, 'leaveRequests', requestId);
-  const logId = makeClientId('log');
-
-  try {
-    await runTransaction(db, async (tx) => {
-      const snap = await tx.get(reqRef);
-      if (!snap.exists()) throw new Error('Leave request not found.');
-      const reqData = snap.data() as LeaveRequest;
-      if (reqData.status !== 'pending') {
-        throw new Error(`Cannot reject: request status is already "${reqData.status}".`);
-      }
-
-      tx.update(reqRef, {
-        status: 'rejected',
-        reviewedByStaffId: reviewer.staffId,
-        reviewedByName: reviewer.fullName,
-        reviewComment: comment.trim() || 'Declined due to operational requirements.',
-        lastAuditLogId: logId,
-        updatedAt: serverTimestamp(),
-      });
-
-      tx.set(doc(db, 'auditLogs', logId), {
-        logId,
-        action: 'LEAVE_REJECTED',
-        targetType: 'leaveRequest',
-        targetId: reqData.requestId,
-        actorStaffId: reviewer.staffId,
-        actorName: reviewer.fullName,
-        actorRole: reviewer.role,
-        summary: `Rejected ${reqData.staffName} (${reqData.staffId}) ${reqData.leaveType}. Reason: ${comment.trim() || 'Operational requirements'}`,
-        previousStatus: 'pending',
-        newStatus: 'rejected',
-        affectedDates: reqData.dates.slice(0, 31),
-        createdAt: serverTimestamp(),
-      });
-    });
-  } catch (err) {
-    if (
-      err instanceof Error &&
-      (err.message.startsWith('Cannot reject') ||
-        err.message === 'Leave request not found.')
-    ) {
-      throw err;
-    }
-    handleFirestoreError(err, OperationType.WRITE, `leaveRequests/${requestId}`);
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
   }
+  const idToken = await user.getIdToken(true);
+  await postWorkerJson<{ ok: boolean; requestId: string }>(
+    '/api/leave/reject',
+    {
+      requestId,
+      comment: comment.trim(),
+    },
+    idToken
+  );
 }
 
 export async function processLeaveModification(
-  reviewer: StaffProfile,
+  _reviewer: StaffProfile,
   requestId: string,
   decision: 'approve_cancel' | 'approve_edit' | 'decline_modification',
   comment: string,
-  settings: AppSettings
+  _settings: AppSettings
 ): Promise<void> {
-  const reqRef = doc(db, 'leaveRequests', requestId);
-  const logId = makeClientId('log');
-  const defaultMaxCap = Math.min(10, Math.max(1, settings.maxDailyCombinedCap || 10));
-
-  try {
-    await runTransaction(db, async (tx) => {
-      const snap = await tx.get(reqRef);
-      if (!snap.exists()) throw new Error('Leave request not found.');
-      const reqData = snap.data() as LeaveRequest;
-      if (reqData.status !== 'approved') {
-        throw new Error('Only approved leave requests can be modified.');
-      }
-
-      if (decision === 'decline_modification') {
-        tx.update(reqRef, {
-          modificationRequestType: 'none',
-          modificationNote: '',
-          requestedStartDate: '',
-          requestedEndDate: '',
-          reviewedByStaffId: reviewer.staffId,
-          reviewedByName: reviewer.fullName,
-          reviewComment: comment.trim() || 'Modification request declined.',
-          lastAuditLogId: logId,
-          updatedAt: serverTimestamp(),
-        });
-        tx.set(doc(db, 'auditLogs', logId), {
-          logId,
-          action: 'LEAVE_MODIFIED',
-          targetType: 'leaveRequest',
-          targetId: reqData.requestId,
-          actorStaffId: reviewer.staffId,
-          actorName: reviewer.fullName,
-          actorRole: reviewer.role,
-          summary: `Declined modification request for ${reqData.staffName} (${reqData.staffId}).`,
-          previousStatus: 'approved',
-          newStatus: 'approved',
-          affectedDates: reqData.dates.slice(0, 31),
-          createdAt: serverTimestamp(),
-        });
-        return;
-      }
-
-      let newDates: string[] = [];
-      if (decision === 'approve_edit') {
-        const expanded = expandDateRange(
-          reqData.requestedStartDate || '',
-          reqData.requestedEndDate || '',
-          30
-        );
-        if (expanded.error) throw new Error(expanded.error);
-        newDates = expanded.dates;
-      }
-
-      const allDateKeys = Array.from(new Set([...reqData.dates, ...newDates])).sort();
-      const capRefs = allDateKeys.map((d) => doc(db, 'dailyCapacity', d));
-      const detailRefs = allDateKeys.map((d) => doc(db, 'dailyCapacityDetails', d));
-      const capSnaps = await Promise.all(capRefs.map((r) => tx.get(r)));
-      const detailSnaps = await Promise.all(detailRefs.map((r) => tx.get(r)));
-
-      const oldSet = new Set(reqData.dates);
-      const newSet = new Set(newDates);
-      const fullDates: string[] = [];
-
-      allDateKeys.forEach((dateKey, idx) => {
-        const capSnap = capSnaps[idx];
-        const used = capSnap.exists() ? Number(capSnap.data()?.approvedCount || 0) : 0;
-        const capLimit = capSnap.exists()
-          ? Number(capSnap.data()?.maxCapacity || defaultMaxCap)
-          : defaultMaxCap;
-        const delta = (newSet.has(dateKey) ? 1 : 0) - (oldSet.has(dateKey) ? 1 : 0);
-        if (reqData.countsTowardDailyCap && delta > 0 && used + delta > capLimit) {
-          fullDates.push(`${dateKey} (${used}/${capLimit})`);
-        }
-      });
-
-      if (fullDates.length > 0) {
-        throw new Error(
-          `Cannot apply new dates — capacity full on: ${fullDates.join(', ')}.`
-        );
-      }
-
-      allDateKeys.forEach((dateKey, idx) => {
-        const capSnap = capSnaps[idx];
-        const detailSnap = detailSnaps[idx];
-        const used = capSnap.exists() ? Number(capSnap.data()?.approvedCount || 0) : 0;
-        const capLimit = capSnap.exists()
-          ? Number(capSnap.data()?.maxCapacity || defaultMaxCap)
-          : defaultMaxCap;
-        const delta = (newSet.has(dateKey) ? 1 : 0) - (oldSet.has(dateKey) ? 1 : 0);
-
-        if (reqData.countsTowardDailyCap && delta !== 0) {
-          tx.set(capRefs[idx], {
-            date: dateKey,
-            approvedCount: Math.max(0, used + delta),
-            maxCapacity: Math.min(10, capLimit),
-            updatedAt: serverTimestamp(),
-          });
-        }
-
-        const existingAllocs = (
-          detailSnap.exists() ? detailSnap.data()?.allocations || [] : []
-        ) as Array<Record<string, unknown>>;
-        let updatedAllocs = existingAllocs.filter(
-          (a) => a.requestId !== reqData.requestId
-        );
-        if (newSet.has(dateKey)) {
-          updatedAllocs = [
-            ...updatedAllocs,
-            {
-              staffId: reqData.staffId,
-              staffName: reqData.staffName,
-              designation: reqData.designation,
-              requestId: reqData.requestId,
-              leaveType: reqData.leaveType,
-            },
-          ];
-        }
-        if (detailSnap.exists() || updatedAllocs.length > 0) {
-          tx.set(detailRefs[idx], {
-            date: dateKey,
-            allocations: updatedAllocs.slice(0, 25),
-            updatedAt: serverTimestamp(),
-          });
-        }
-      });
-
-      if (decision === 'approve_cancel') {
-        tx.update(reqRef, {
-          status: 'cancelled',
-          modificationRequestType: 'none',
-          reviewedByStaffId: reviewer.staffId,
-          reviewedByName: reviewer.fullName,
-          reviewComment:
-            comment.trim() || 'Approved leave cancelled and capacity released.',
-          lastAuditLogId: logId,
-          updatedAt: serverTimestamp(),
-        });
-        tx.set(doc(db, 'auditLogs', logId), {
-          logId,
-          action: 'LEAVE_CANCELLED',
-          targetType: 'leaveRequest',
-          targetId: reqData.requestId,
-          actorStaffId: reviewer.staffId,
-          actorName: reviewer.fullName,
-          actorRole: reviewer.role,
-          summary: `Cancelled approved leave for ${reqData.staffName} (${reqData.staffId}) and released daily slots.`,
-          previousStatus: 'approved',
-          newStatus: 'cancelled',
-          affectedDates: reqData.dates.slice(0, 31),
-          createdAt: serverTimestamp(),
-        });
-      } else {
-        tx.update(reqRef, {
-          startDate: reqData.requestedStartDate!,
-          endDate: reqData.requestedEndDate!,
-          dates: newDates,
-          daysCount: newDates.length,
-          calendarYear: Number(reqData.requestedStartDate!.slice(0, 4)),
-          modificationRequestType: 'none',
-          modificationNote: '',
-          requestedStartDate: '',
-          requestedEndDate: '',
-          reviewedByStaffId: reviewer.staffId,
-          reviewedByName: reviewer.fullName,
-          reviewComment: comment.trim() || 'Approved date modification applied.',
-          lastAuditLogId: logId,
-          updatedAt: serverTimestamp(),
-        });
-        tx.set(doc(db, 'auditLogs', logId), {
-          logId,
-          action: 'LEAVE_MODIFIED',
-          targetType: 'leaveRequest',
-          targetId: reqData.requestId,
-          actorStaffId: reviewer.staffId,
-          actorName: reviewer.fullName,
-          actorRole: reviewer.role,
-          summary: `Updated approved leave dates for ${reqData.staffName} (${reqData.staffId}) to ${reqData.requestedStartDate} – ${reqData.requestedEndDate}.`,
-          previousStatus: 'approved',
-          newStatus: 'approved',
-          affectedDates: allDateKeys.slice(0, 31),
-          createdAt: serverTimestamp(),
-        });
-      }
-    });
-  } catch (err) {
-    if (
-      err instanceof Error &&
-      (err.message.startsWith('Cannot apply') ||
-        err.message.startsWith('Only approved') ||
-        err.message === 'Leave request not found.')
-    ) {
-      throw err;
-    }
-    handleFirestoreError(err, OperationType.WRITE, `leaveRequests/${requestId}`);
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
   }
+  const idToken = await user.getIdToken(true);
+  await postWorkerJson<{ ok: boolean; requestId: string }>(
+    '/api/leave/process-modification',
+    {
+      requestId,
+      decision,
+      comment: comment.trim(),
+    },
+    idToken
+  );
+}
+
+export async function removeApprovedLeaveRequest(requestId: string): Promise<void> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
+  }
+  const idToken = await user.getIdToken(true);
+  await postWorkerJson<{ ok: boolean; requestId: string }>(
+    '/api/leave/remove-approved',
+    { requestId },
+    idToken
+  );
 }
 
 export async function updateStaffProfile(
@@ -1224,107 +1021,17 @@ export async function removeStaffAccount(
   if (target.staffId === actor.staffId) {
     throw new Error('You cannot remove your own currently signed-in account.');
   }
-
-  const reqSnap = await getDocs(
-    query(collection(db, 'leaveRequests'), where('staffId', '==', target.staffId))
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
+  }
+  const idToken = await user.getIdToken(true);
+  const res = await postWorkerJson<{ ok: boolean; removedRequests: number }>(
+    '/api/admin/remove-staff',
+    { targetStaffId: target.staffId },
+    idToken
   );
-  const reqDocs = reqSnap.docs;
-
-  const removedCountsByDate = new Map<string, number>();
-  const removedReqIds = new Set<string>();
-  const affectedDatesSet = new Set<string>();
-
-  for (const d of reqDocs) {
-    const reqData = d.data() as LeaveRequest;
-    removedReqIds.add(reqData.requestId || d.id);
-    if (reqData.status === 'approved') {
-      for (const dateKey of reqData.dates || []) {
-        affectedDatesSet.add(dateKey);
-        if (reqData.countsTowardDailyCap) {
-          removedCountsByDate.set(
-            dateKey,
-            (removedCountsByDate.get(dateKey) || 0) + 1
-          );
-        }
-      }
-    }
-  }
-
-  const affectedDates = Array.from(affectedDatesSet).sort();
-
-  try {
-    await runTransaction(db, async (tx) => {
-      const capRefs = affectedDates.map((d) => doc(db, 'dailyCapacity', d));
-      const detailRefs = affectedDates.map((d) => doc(db, 'dailyCapacityDetails', d));
-
-      const capSnaps = await Promise.all(capRefs.map((r) => tx.get(r)));
-      const detailSnaps = await Promise.all(detailRefs.map((r) => tx.get(r)));
-
-      affectedDates.forEach((dateKey, idx) => {
-        const capSnap = capSnaps[idx];
-        const detailSnap = detailSnaps[idx];
-        const removeCount = removedCountsByDate.get(dateKey) || 0;
-
-        if (capSnap.exists() && removeCount > 0) {
-          const used = Number(capSnap.data()?.approvedCount || 0);
-          const capLimit = Number(capSnap.data()?.maxCapacity || 10);
-          tx.set(capRefs[idx], {
-            date: dateKey,
-            approvedCount: Math.max(0, used - removeCount),
-            maxCapacity: Math.min(10, capLimit),
-            updatedAt: serverTimestamp(),
-          });
-        }
-
-        if (detailSnap.exists()) {
-          const existingAllocs = (
-            detailSnap.data()?.allocations || []
-          ) as Array<Record<string, unknown>>;
-          const nextAllocs = existingAllocs.filter(
-            (a) =>
-              a.staffId !== target.staffId &&
-              !removedReqIds.has(String(a.requestId || ''))
-          );
-          tx.set(detailRefs[idx], {
-            date: dateKey,
-            allocations: nextAllocs.slice(0, 25),
-            updatedAt: serverTimestamp(),
-          });
-        }
-      });
-
-      for (const d of reqDocs) {
-        tx.delete(d.ref);
-      }
-
-      tx.delete(doc(db, 'staff', target.staffId));
-      if (target.authUid) {
-        tx.delete(doc(db, 'staffAuthLinks', target.authUid));
-      }
-
-      const logId = makeClientId('log');
-      tx.set(doc(db, 'auditLogs', logId), {
-        logId,
-        action: 'STAFF_REMOVED',
-        targetType: 'staff',
-        targetId: target.staffId,
-        actorStaffId: actor.staffId,
-        actorName: actor.fullName,
-        actorRole: actor.role,
-        summary: `Removed staff record ${target.staffId} (${target.fullName}, ${target.designation}); deleted ${reqDocs.length} leave request(s) and released ${affectedDates.length} approved date slot(s).`,
-        previousStatus: target.isActive ? 'active' : 'inactive',
-        newStatus: 'removed',
-        ...(affectedDates.length > 0
-          ? { affectedDates: affectedDates.slice(0, 31) }
-          : {}),
-        createdAt: serverTimestamp(),
-      });
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `staff/${target.staffId}`);
-  }
-
-  return { removedRequests: reqDocs.length };
+  return { removedRequests: Number(res.removedRequests || 0) };
 }
 
 export async function updatePortalSettings(
@@ -1364,4 +1071,69 @@ export async function updatePortalSettings(
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, 'appSettings/portalConfig');
   }
+}
+
+export async function saveLeaveRestriction(payload: {
+  restrictionId?: string;
+  startDate: string;
+  endDate: string;
+  targetType: RestrictionTargetType;
+  targetStaffIds: string[];
+  reason: string;
+  isActive: boolean;
+}): Promise<LeaveRestriction> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
+  }
+  const idToken = await user.getIdToken(true);
+  const res = await postWorkerJson<{ ok: boolean; restriction: LeaveRestriction }>(
+    '/api/admin/restrictions/save',
+    payload,
+    idToken
+  );
+  return res.restriction;
+}
+
+export async function deleteLeaveRestriction(restrictionId: string): Promise<void> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
+  }
+  const idToken = await user.getIdToken(true);
+  await postWorkerJson<{ ok: boolean; restrictionId: string }>(
+    '/api/admin/restrictions/delete',
+    { restrictionId },
+    idToken
+  );
+}
+
+export async function clearAllLeaveRecords(confirmation: string): Promise<{
+  deletedRequests: number;
+  deletedCapacityDocs: number;
+  deletedDetailDocs: number;
+}> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
+  }
+  if (confirmation.trim() !== 'DELETE ALL') {
+    throw new Error('Please type "DELETE ALL" to confirm.');
+  }
+  const idToken = await user.getIdToken(true);
+  const res = await postWorkerJson<{
+    ok: boolean;
+    deletedRequests: number;
+    deletedCapacityDocs: number;
+    deletedDetailDocs: number;
+  }>(
+    '/api/admin/clear-all-leave',
+    { confirmation: confirmation.trim() },
+    idToken
+  );
+  return {
+    deletedRequests: Number(res.deletedRequests || 0),
+    deletedCapacityDocs: Number(res.deletedCapacityDocs || 0),
+    deletedDetailDocs: Number(res.deletedDetailDocs || 0),
+  };
 }

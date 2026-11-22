@@ -1,10 +1,13 @@
 import {
   AppSettings,
   DailyCapacity,
+  DailyCapacityDetail,
   LeaveRequest,
+  LeaveRestriction,
   StaffProfile,
 } from '../types/portal';
 import { expandDateRange, formatDisplayDate } from './maldivesDate';
+import { findRestrictedDatesForStaff, formatLongDate } from './leaveRestrictions';
 
 export interface AnnualPeriodSummary {
   year: number;
@@ -15,12 +18,22 @@ export interface AnnualPeriodSummary {
   remainingPeriods: number;
 }
 
+export interface DailyCapacityBreakdown {
+  occupiedCount: number;
+  approvedOnlyCount: number;
+  pendingCount: number;
+  maxCapacity: number;
+  availableSlots: number;
+  isFull: boolean;
+}
+
 export interface LeaveValidationResult {
   valid: boolean;
   dates: string[];
   errors: string[];
   unavailableDates: Array<{
     date: string;
+    occupiedCount: number;
     approvedCount: number;
     maxCapacity: number;
     pendingCount: number;
@@ -29,6 +42,13 @@ export interface LeaveValidationResult {
     date: string;
     pendingCount: number;
   }>;
+  blockedDates: string[];
+  matchedRestrictions: LeaveRestriction[];
+}
+
+export function doesRequestDesignationCountTowardCap(designation: string): boolean {
+  const norm = String(designation || '').trim().toUpperCase();
+  return norm === 'ASSISTANT OFFICER' || norm === 'ATTENDANT';
 }
 
 export function calculateAnnualPeriodUsage(
@@ -66,6 +86,100 @@ export function buildPendingDemandMap(requests: LeaveRequest[]): Record<string, 
   return map;
 }
 
+/**
+ * Single source of truth for daily slot occupancy across Calendar, Dashboard,
+ * Available Slots, and Leave Submission Form:
+ * - Both Pending and Approved applications for Assistant Officers & Attendants
+ *   occupy slots immediately toward the 10-slot combined daily limit.
+ * - When `pendingReservesCapacity` is active (synced), `dailyCapacity.approvedCount`
+ *   already holds the combined occupied count (Pending + Approved) without double-counting.
+ */
+export function getDailyCapacityBreakdown(params: {
+  dateKey: string;
+  capacityMap: Record<string, DailyCapacity>;
+  pendingDemandMap?: Record<string, number>;
+  capacityDetailsMap?: Record<string, DailyCapacityDetail>;
+  defaultMaxCap?: number;
+  pendingReservesCapacity?: boolean;
+}): DailyCapacityBreakdown {
+  const {
+    dateKey,
+    capacityMap,
+    pendingDemandMap = {},
+    capacityDetailsMap,
+    defaultMaxCap = 10,
+    pendingReservesCapacity = true,
+  } = params;
+
+  const cap = capacityMap[dateKey];
+  const detailAllocs = capacityDetailsMap?.[dateKey]?.allocations;
+  const maxCapacity = cap ? cap.maxCapacity || defaultMaxCap : defaultMaxCap;
+
+  if (pendingReservesCapacity) {
+    let occupiedCount = cap ? Number(cap.approvedCount || 0) : 0;
+    let pendingCount =
+      cap && typeof cap.pendingCount === 'number' ? Number(cap.pendingCount) : 0;
+    let approvedOnlyCount =
+      cap && typeof cap.approvedOnlyCount === 'number'
+        ? Number(cap.approvedOnlyCount)
+        : 0;
+
+    if (detailAllocs && detailAllocs.length > 0) {
+      let detailPending = 0;
+      let detailApproved = 0;
+      for (const a of detailAllocs) {
+        if (!doesRequestDesignationCountTowardCap(a.designation)) continue;
+        if (a.status === 'pending') detailPending += 1;
+        else detailApproved += 1;
+      }
+      if (!cap) {
+        occupiedCount = detailPending + detailApproved;
+        pendingCount = detailPending;
+        approvedOnlyCount = detailApproved;
+      } else {
+        if (typeof cap.pendingCount !== 'number') {
+          pendingCount = detailPending;
+        }
+        if (typeof cap.approvedOnlyCount !== 'number') {
+          approvedOnlyCount = Math.max(0, occupiedCount - pendingCount);
+        }
+      }
+    } else if (cap) {
+      if (typeof cap.pendingCount !== 'number') {
+        pendingCount = Math.min(occupiedCount, pendingDemandMap[dateKey] || 0);
+      }
+      if (typeof cap.approvedOnlyCount !== 'number') {
+        approvedOnlyCount = Math.max(0, occupiedCount - pendingCount);
+      }
+    }
+
+    const availableSlots = Math.max(0, maxCapacity - occupiedCount);
+    return {
+      occupiedCount,
+      approvedOnlyCount,
+      pendingCount,
+      maxCapacity,
+      availableSlots,
+      isFull: occupiedCount >= maxCapacity,
+    };
+  }
+
+  // Fallback before initial reconciliation completes
+  const approvedOnlyCount = cap ? Number(cap.approvedCount || 0) : 0;
+  const pendingCount = pendingDemandMap[dateKey] || 0;
+  const occupiedCount = approvedOnlyCount + pendingCount;
+  const availableSlots = Math.max(0, maxCapacity - occupiedCount);
+
+  return {
+    occupiedCount,
+    approvedOnlyCount,
+    pendingCount,
+    maxCapacity,
+    availableSlots,
+    isFull: occupiedCount >= maxCapacity,
+  };
+}
+
 export function validateLeaveSubmission(params: {
   staff: StaffProfile;
   startDate: string;
@@ -74,7 +188,9 @@ export function validateLeaveSubmission(params: {
   userRequests: LeaveRequest[];
   capacityMap: Record<string, DailyCapacity>;
   pendingDemandMap: Record<string, number>;
+  capacityDetailsMap?: Record<string, DailyCapacityDetail>;
   settings: AppSettings;
+  restrictions?: LeaveRestriction[];
   excludeRequestId?: string;
 }): LeaveValidationResult {
   const {
@@ -85,7 +201,9 @@ export function validateLeaveSubmission(params: {
     userRequests,
     capacityMap,
     pendingDemandMap,
+    capacityDetailsMap,
     settings,
+    restrictions = [],
     excludeRequestId,
   } = params;
 
@@ -111,6 +229,8 @@ export function validateLeaveSubmission(params: {
       errors,
       unavailableDates,
       pendingOverlapDates,
+      blockedDates: [],
+      matchedRestrictions: [],
     };
   }
 
@@ -153,28 +273,27 @@ export function validateLeaveSubmission(params: {
 
   const maxDailyCap = settings.maxDailyCombinedCap || 10;
   for (const dateKey of dates) {
-    const cap = capacityMap[dateKey];
-    const approvedCount = cap ? cap.approvedCount : 0;
-    const maxCapacity = cap ? cap.maxCapacity : maxDailyCap;
-    const pendingCount = pendingDemandMap[dateKey] || 0;
+    const breakdown = getDailyCapacityBreakdown({
+      dateKey,
+      capacityMap,
+      pendingDemandMap,
+      capacityDetailsMap,
+      defaultMaxCap: maxDailyCap,
+      pendingReservesCapacity: Boolean(settings.pendingReservesCapacity),
+    });
 
-    if (pendingCount > 0) {
-      pendingOverlapDates.push({ date: dateKey, pendingCount });
+    if (breakdown.pendingCount > 0) {
+      pendingOverlapDates.push({ date: dateKey, pendingCount: breakdown.pendingCount });
     }
 
-    if (staff.countsTowardDailyCap) {
-      const effectiveUsed = settings.pendingReservesCapacity
-        ? approvedCount + pendingCount
-        : approvedCount;
-
-      if (effectiveUsed >= maxCapacity) {
-        unavailableDates.push({
-          date: dateKey,
-          approvedCount,
-          maxCapacity,
-          pendingCount,
-        });
-      }
+    if (staff.countsTowardDailyCap && breakdown.isFull) {
+      unavailableDates.push({
+        date: dateKey,
+        occupiedCount: breakdown.occupiedCount,
+        approvedCount: breakdown.approvedOnlyCount,
+        maxCapacity: breakdown.maxCapacity,
+        pendingCount: breakdown.pendingCount,
+      });
     }
   }
 
@@ -182,11 +301,19 @@ export function validateLeaveSubmission(params: {
     const formattedList = unavailableDates
       .map(
         (u) =>
-          `${formatDisplayDate(u.date)} (${u.approvedCount}/${u.maxCapacity} approved slots taken)`
+          `${formatDisplayDate(u.date)} (${u.occupiedCount}/${u.maxCapacity} slots occupied)`
       )
       .join('; ');
     errors.push(
       `Daily unit capacity limit (${maxDailyCap} combined Assistant Officers & Attendants) is full on: ${formattedList}.`
+    );
+  }
+
+  const restrictionCheck = findRestrictedDatesForStaff(dates, restrictions, staff);
+  if (restrictionCheck.matchedRestrictions.length > 0) {
+    const primary = restrictionCheck.matchedRestrictions[0];
+    errors.push(
+      `Leave applications are not permitted from ${formatLongDate(primary.startDate)} to ${formatLongDate(primary.endDate)}. Reason: ${primary.reason}. Please select alternative dates.`
     );
   }
 
@@ -196,13 +323,22 @@ export function validateLeaveSubmission(params: {
     errors,
     unavailableDates,
     pendingOverlapDates,
+    blockedDates: restrictionCheck.blockedDates,
+    matchedRestrictions: restrictionCheck.matchedRestrictions,
   };
 }
 
+/**
+ * Checks whether approving a pending request can proceed within daily cap.
+ * Since pending requests reserve their slot on submission, approving an
+ * already-reserved request keeps occupancy unchanged (no double-counting).
+ */
 export function checkApprovalCapacityFeasibility(
   request: LeaveRequest,
   capacityMap: Record<string, DailyCapacity>,
-  defaultCap = 10
+  defaultCap = 10,
+  capacityDetailsMap?: Record<string, DailyCapacityDetail>,
+  pendingReservesCapacity = true
 ): {
   feasible: boolean;
   fullDates: Array<{ date: string; approvedCount: number; maxCapacity: number }>;
@@ -213,10 +349,16 @@ export function checkApprovalCapacityFeasibility(
   const fullDates: Array<{ date: string; approvedCount: number; maxCapacity: number }> = [];
   for (const dateKey of request.dates) {
     const cap = capacityMap[dateKey];
-    const approvedCount = cap ? cap.approvedCount : 0;
-    const maxCapacity = cap ? cap.maxCapacity : defaultCap;
-    if (approvedCount >= maxCapacity) {
-      fullDates.push({ date: dateKey, approvedCount, maxCapacity });
+    const occupied = cap ? Number(cap.approvedCount || 0) : 0;
+    const maxCapacity = cap ? Number(cap.maxCapacity || defaultCap) : defaultCap;
+    const details = capacityDetailsMap?.[dateKey]?.allocations;
+    const alreadyReserved = details
+      ? details.some((a) => a.requestId === request.requestId)
+      : pendingReservesCapacity && occupied > 0;
+
+    const projected = alreadyReserved ? occupied : occupied + 1;
+    if (projected > maxCapacity) {
+      fullDates.push({ date: dateKey, approvedCount: occupied, maxCapacity });
     }
   }
   return {

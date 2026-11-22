@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import {
   AdministrationView,
@@ -29,22 +29,29 @@ import {
   approveLeaveRequest,
   cancelPendingLeaveRequest,
   changeOwnPassword,
+  clearAllLeaveRecords,
+  deleteLeaveRestriction,
+  fetchLeaveRestrictionsFromWorker,
   logoutSession,
   processLeaveModification,
   rejectLeaveRequest,
+  removeApprovedLeaveRequest,
   removeStaffAccount,
   requestLeaveModification,
   resetStaffPinByManager,
   resolveSignedInStaffProfile,
+  saveLeaveRestriction,
   submitLeaveRequest,
   subscribeAllRequests,
   subscribeAllStaff,
   subscribeAuditLogs,
+  subscribeLeaveRestrictions,
   subscribeMonthCapacity,
   subscribeMonthCapacityDetails,
   subscribeMyRequests,
   subscribeSettings,
   subscribeStaffProfile,
+  syncPendingCapacity,
   updatePortalSettings,
   updateStaffProfile,
 } from './services/firebasePortalService';
@@ -55,8 +62,10 @@ import {
   DailyCapacityDetail,
   Designation,
   LeaveRequest,
+  LeaveRestriction,
   LeaveType,
   PortalView,
+  RestrictionTargetType,
   StaffProfile,
   ToastMessage,
   UserRole,
@@ -105,7 +114,11 @@ export default function App() {
     Record<string, DailyCapacityDetail>
   >({});
   const [liveAuditLogs, setLiveAuditLogs] = useState<AuditLog[]>([]);
+  const [liveRestrictions, setLiveRestrictions] = useState<LeaveRestriction[]>([]);
   const [loadingRequests, setLoadingRequests] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const syncedPendingRef = useRef(false);
+  const restrictionsFallbackRef = useRef(false);
 
   // Navigation & Calendar state
   const [activeView, setActiveView] = useState<PortalView>('dashboard');
@@ -144,7 +157,11 @@ export default function App() {
     setLiveCapacityMap({});
     setLiveCapacityDetailsMap({});
     setLiveAuditLogs([]);
+    setLiveRestrictions([]);
     setLoadingRequests(false);
+    setSettingsLoaded(false);
+    syncedPendingRef.current = false;
+    restrictionsFallbackRef.current = false;
   }, []);
 
   // Listen to Firebase Auth state changes
@@ -207,7 +224,10 @@ export default function App() {
         },
         onSubError
       ),
-      subscribeSettings(setLiveSettings, onSubError),
+      subscribeSettings((nextSettings) => {
+        setLiveSettings(nextSettings);
+        setSettingsLoaded(true);
+      }, onSubError),
       subscribeMyRequests(
         activeStaffId,
         (items) => {
@@ -215,6 +235,14 @@ export default function App() {
           setLoadingRequests(false);
         },
         onSubError
+      ),
+      subscribeLeaveRestrictions(
+        (items) => {
+          setLiveRestrictions(items);
+        },
+        () => {
+          restrictionsFallbackRef.current = true;
+        }
       ),
     ];
 
@@ -267,6 +295,22 @@ export default function App() {
       unsubDetails();
     };
   }, [activeStaffId, calendarYear, calendarMonth0, addToast]);
+
+  // One-time automatic backfill so existing Pending requests reserve daily slots immediately
+  useEffect(() => {
+    if (
+      !activeStaffId ||
+      !settingsLoaded ||
+      liveSettings.pendingReservesCapacity ||
+      syncedPendingRef.current
+    ) {
+      return;
+    }
+    syncedPendingRef.current = true;
+    void syncPendingCapacity(false).catch(() => {
+      syncedPendingRef.current = false;
+    });
+  }, [activeStaffId, settingsLoaded, liveSettings.pendingReservesCapacity]);
 
   const handleLoginSuccess = (user: StaffProfile) => {
     setAuthErrorBanner(null);
@@ -351,14 +395,18 @@ export default function App() {
     addToast(
       'success',
       'Leave Request Submitted',
-      `${payload.dates.length} day(s) saved to Cloud Firestore.`
+      `${payload.dates.length} day(s) submitted and daily slots reserved while Pending.`
     );
   };
 
   const handleCancelPending = async (req: LeaveRequest) => {
     if (!liveProfile) return;
     await cancelPendingLeaveRequest(liveProfile, req);
-    addToast('info', 'Pending Request Cancelled');
+    addToast(
+      'info',
+      'Pending Request Cancelled',
+      'Reserved daily slots have been released.'
+    );
   };
 
   const handleRequestModification = async (params: {
@@ -404,6 +452,22 @@ export default function App() {
       liveSettings
     );
     addToast('success', 'Modification Processed', 'Daily slots and audit log updated.');
+  };
+
+  const handleRemoveApprovedLeave = async (requestId: string) => {
+    if (!liveProfile) return;
+    try {
+      await removeApprovedLeaveRequest(requestId);
+      addToast(
+        'success',
+        'Approved Leave Removed',
+        'Leave marked as Cancelled and all occupied daily slots released.'
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to remove approved leave.';
+      addToast('error', 'Failed to Remove Leave', msg);
+      throw err;
+    }
   };
 
   const handleUpdateStaff = async (
@@ -479,6 +543,52 @@ export default function App() {
     addToast('success', 'Portal Settings Saved');
   };
 
+  const handleSaveRestriction = async (payload: {
+    restrictionId?: string;
+    startDate: string;
+    endDate: string;
+    targetType: RestrictionTargetType;
+    targetStaffIds: string[];
+    reason: string;
+    isActive: boolean;
+  }) => {
+    const saved = await saveLeaveRestriction(payload);
+    if (restrictionsFallbackRef.current) {
+      const fresh = await fetchLeaveRestrictionsFromWorker().catch(() => null);
+      if (fresh) {
+        setLiveRestrictions(fresh);
+      } else {
+        setLiveRestrictions((prev) => {
+          const rest = prev.filter((r) => r.restrictionId !== saved.restrictionId);
+          return [saved, ...rest].sort((a, b) => b.startDate.localeCompare(a.startDate));
+        });
+      }
+    }
+    addToast(
+      'success',
+      payload.restrictionId ? 'Restriction Updated' : 'Restriction Saved',
+      `Blocked period ${payload.startDate} – ${payload.endDate} saved.`
+    );
+  };
+
+  const handleDeleteRestriction = async (restrictionId: string) => {
+    await deleteLeaveRestriction(restrictionId);
+    if (restrictionsFallbackRef.current) {
+      setLiveRestrictions((prev) => prev.filter((r) => r.restrictionId !== restrictionId));
+    }
+    addToast('info', 'Restriction Removed', 'Dates are now open subject to daily capacity.');
+  };
+
+  const handleClearAllLeaveRecords = async (confirmation: string) => {
+    const result = await clearAllLeaveRecords(confirmation);
+    addToast(
+      'success',
+      'All Leave Records Cleared',
+      `${result.deletedRequests} leave application(s) and ${result.deletedCapacityDocs} daily slot counter(s) reset to zero.`
+    );
+    return result;
+  };
+
   // Loading state during Firebase Auth initialization
   if (!authReady) {
     return (
@@ -529,6 +639,7 @@ export default function App() {
           capacityMap={liveCapacityMap}
           capacityDetailsMap={liveCapacityDetailsMap}
           settings={liveSettings}
+          restrictions={liveRestrictions}
           calendarYear={calendarYear}
           calendarMonth0={calendarMonth0}
           onChangeMonth={(y, m0) => {
@@ -554,6 +665,7 @@ export default function App() {
           allRequests={activeAllRequests}
           currentProfile={liveProfile}
           settings={liveSettings}
+          restrictions={liveRestrictions}
           onRequestRange={handleOpenNewRequest}
         />
       )}
@@ -562,6 +674,7 @@ export default function App() {
         <MyRequestsView
           profile={liveProfile}
           requests={liveMyRequests}
+          restrictions={liveRestrictions}
           loading={loadingRequests}
           onOpenNewRequest={() => handleOpenNewRequest()}
           onCancelPending={handleCancelPending}
@@ -576,10 +689,12 @@ export default function App() {
             profiles={liveProfiles}
             allRequests={activeAllRequests}
             capacityMap={liveCapacityMap}
+            capacityDetailsMap={liveCapacityDetailsMap}
             settings={liveSettings}
             onApprove={handleApproveLeave}
             onReject={handleRejectLeave}
             onProcessModification={handleProcessModification}
+            onRemoveApproved={handleRemoveApprovedLeave}
           />
         )}
 
@@ -604,11 +719,14 @@ export default function App() {
           currentProfile={liveProfile}
           profiles={liveProfiles}
           settings={liveSettings}
+          restrictions={liveRestrictions}
           onAddStaff={handleAddStaff}
           onUpdateStaff={handleUpdateStaff}
           onRemoveStaff={handleRemoveStaff}
           onResetStaffPin={handleResetStaffPin}
           onUpdateSettings={handleUpdateSettings}
+          onSaveRestriction={handleSaveRestriction}
+          onDeleteRestriction={handleDeleteRestriction}
         />
       )}
 
@@ -617,7 +735,10 @@ export default function App() {
       )}
 
       {activeView === 'deployment' && liveProfile.role === 'manager' && (
-        <DeploymentSecurityView />
+        <DeploymentSecurityView
+          currentProfile={liveProfile}
+          onClearAllLeaveRecords={handleClearAllLeaveRecords}
+        />
       )}
 
       <LeaveRequestModal
@@ -626,8 +747,10 @@ export default function App() {
         staff={liveProfile}
         userRequests={liveMyRequests}
         capacityMap={liveCapacityMap}
+        capacityDetailsMap={liveCapacityDetailsMap}
         pendingDemandMap={pendingDemandMap}
         settings={liveSettings}
+        restrictions={liveRestrictions}
         initialStartDate={prefillStart}
         initialEndDate={prefillEnd}
         onSubmit={handleSubmitLeave}

@@ -284,7 +284,7 @@
     },
     "DailyCapacity": {
       "title": "DailyCapacity",
-      "description": "Atomic daily capacity counter (max 10 combined allocations for Assistant Officers and Attendants).",
+      "description": "Atomic daily capacity counter (max 10 combined Pending + Approved allocations for Assistant Officers and Attendants).",
       "type": "object",
       "properties": {
         "date": {
@@ -294,6 +294,13 @@
           "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
         },
         "approvedCount": {
+          "type": "integer",
+          "description": "Combined occupied daily cap slots (Pending + Approved Assistant Officers and Attendants)."
+        },
+        "approvedOnlyCount": {
+          "type": "integer"
+        },
+        "pendingCount": {
           "type": "integer"
         },
         "maxCapacity": {
@@ -308,7 +315,7 @@
     },
     "DailyCapacityDetail": {
       "title": "DailyCapacityDetail",
-      "description": "Approved staff allocations for a given calendar date.",
+      "description": "Pending and approved staff allocations for a given calendar date.",
       "type": "object",
       "properties": {
         "date": {
@@ -319,7 +326,7 @@
         },
         "allocations": {
           "type": "array",
-          "description": "Bounded list (max 25) of approved allocation summaries."
+          "description": "Bounded list (max 60) of pending and approved allocation summaries."
         },
         "updatedAt": {
           "type": "string",
@@ -347,6 +354,9 @@
             "LEAVE_REJECTED",
             "LEAVE_CANCELLED",
             "LEAVE_MODIFIED",
+            "LEAVE_DATA_CLEARED",
+            "RESTRICTION_SAVED",
+            "RESTRICTION_REMOVED",
             "MOD_REQUESTED",
             "STAFF_PROVISIONED",
             "STAFF_IMPORTED",
@@ -360,7 +370,7 @@
         },
         "targetType": {
           "type": "string",
-          "enum": ["leaveRequest", "staff", "appSettings"]
+          "enum": ["leaveRequest", "staff", "appSettings", "leaveRestriction"]
         },
         "targetId": {
           "type": "string",
@@ -464,6 +474,87 @@
         "updatedByStaffId",
         "updatedAt"
       ]
+    },
+    "LeaveRestriction": {
+      "title": "LeaveRestriction",
+      "description": "Blocked leave date range configured by a Manager for all staff, specific designations, or selected staff members.",
+      "type": "object",
+      "properties": {
+        "restrictionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "startDate": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "endDate": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 10,
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "targetType": {
+          "type": "string",
+          "enum": [
+            "all",
+            "assistant_officer",
+            "attendant",
+            "executive",
+            "officer",
+            "selected_staff"
+          ]
+        },
+        "targetStaffIds": {
+          "type": "array"
+        },
+        "targetStaffNames": {
+          "type": "array"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 300
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "createdByStaffId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "createdByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "restrictionId",
+        "startDate",
+        "endDate",
+        "targetType",
+        "targetStaffIds",
+        "reason",
+        "isActive",
+        "createdByStaffId",
+        "createdByName",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -485,11 +576,11 @@
     },
     "/dailyCapacity/{dateKey}": {
       "schema": { "$ref": "#/entities/DailyCapacity" },
-      "description": "Daily approved leave slot counters (max 10 for Assistant Officers & Attendants)."
+      "description": "Daily occupied leave slot counters (Pending + Approved, max 10 for Assistant Officers & Attendants)."
     },
     "/dailyCapacityDetails/{dateKey}": {
       "schema": { "$ref": "#/entities/DailyCapacityDetail" },
-      "description": "Daily approved staff allocation details."
+      "description": "Daily pending and approved staff allocation details."
     },
     "/auditLogs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
@@ -498,6 +589,10 @@
     "/appSettings/{settingId}": {
       "schema": { "$ref": "#/entities/AppSettings" },
       "description": "Global unit leave rules and portal settings."
+    },
+    "/leaveRestrictions/{restrictionId}": {
+      "schema": { "$ref": "#/entities/LeaveRestriction" },
+      "description": "Manager-configured leave date restrictions synchronized across all devices."
     }
   }
 }

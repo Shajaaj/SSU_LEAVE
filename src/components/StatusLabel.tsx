@@ -87,3 +87,42 @@ export const AvailabilityLabel: React.FC<{
     </span>
   );
 };
+
+export const LeaveColorLegend: React.FC<{ className?: string }> = ({
+  className = '',
+}) => (
+  <div
+    className={`flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[11px] text-slate-600 dark:text-slate-300 ${className}`}
+    aria-label="Leave colour legend"
+  >
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+      <span
+        className="w-3.5 h-2.5 rounded-[2px] bg-blue-600 border border-blue-700 dark:border-blue-400 inline-block shrink-0"
+        aria-hidden="true"
+      />
+      <span>Staff Approved</span>
+    </span>
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+      <span
+        className="w-3.5 h-2.5 rounded-[2px] leave-bar-pending-staff border border-blue-600 dark:border-blue-400 inline-block shrink-0"
+        aria-hidden="true"
+      />
+      <span>Staff Pending</span>
+    </span>
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+      <span
+        className="w-3.5 h-2.5 rounded-[2px] bg-purple-600 border border-purple-700 dark:border-purple-400 inline-block shrink-0"
+        aria-hidden="true"
+      />
+      <span>Executive Approved</span>
+    </span>
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+      <span
+        className="w-3.5 h-2.5 rounded-[2px] leave-bar-pending-executive border border-purple-600 dark:border-purple-400 inline-block shrink-0"
+        aria-hidden="true"
+      />
+      <span>Executive Pending</span>
+    </span>
+  </div>
+);
+
