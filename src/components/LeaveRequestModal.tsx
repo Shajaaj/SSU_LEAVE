@@ -9,7 +9,12 @@ import {
   LeaveType,
   StaffProfile,
 } from '../types/portal';
-import { fetchCapacityForDates } from '../services/firebasePortalService';
+import {
+  RestrictedLeaveError,
+  fetchCapacityForDates,
+  loadActiveRestrictionsStrict,
+} from '../services/firebasePortalService';
+import { findRestrictedDatesForStaff } from '../utils/leaveRestrictions';
 import {
   calculateAnnualPeriodUsage,
   getDailyCapacityBreakdown,
@@ -32,6 +37,9 @@ interface LeaveRequestModalProps {
   pendingDemandMap: Record<string, number>;
   settings: AppSettings;
   restrictions?: LeaveRestriction[];
+  restrictionsStatus?: 'loading' | 'ready' | 'error';
+  restrictionsError?: string | null;
+  onRefreshRestrictions?: () => Promise<LeaveRestriction[]>;
   initialStartDate?: string;
   initialEndDate?: string;
   onSubmit: (payload: {
@@ -53,6 +61,9 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
   pendingDemandMap,
   settings,
   restrictions = [],
+  restrictionsStatus = 'ready',
+  restrictionsError = null,
+  onRefreshRestrictions,
   initialStartDate,
   initialEndDate,
   onSubmit,
@@ -65,6 +76,11 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [dismissedPopupSig, setDismissedPopupSig] = useState<string | null>(null);
+  const [runtimeBlocked, setRuntimeBlocked] = useState<{
+    blockedDates: string[];
+    matchedRestrictions: LeaveRestriction[];
+  } | null>(null);
+  const [retryingRestrictions, setRetryingRestrictions] = useState(false);
   const [extraCapMap, setExtraCapMap] = useState<Record<string, DailyCapacity>>({});
   const [extraDetailsMap, setExtraDetailsMap] = useState<
     Record<string, DailyCapacityDetail>
@@ -79,6 +95,7 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
       setReason('');
       setSubmitError(null);
       setDismissedPopupSig(null);
+      setRuntimeBlocked(null);
       setExtraCapMap({});
       setExtraDetailsMap({});
     }
@@ -161,9 +178,19 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
     ]
   );
 
+  const activeBlockedDates =
+    runtimeBlocked && runtimeBlocked.blockedDates.length > 0
+      ? runtimeBlocked.blockedDates
+      : validation.blockedDates;
+
+  const activeMatchedRestrictions =
+    runtimeBlocked && runtimeBlocked.matchedRestrictions.length > 0
+      ? runtimeBlocked.matchedRestrictions
+      : validation.matchedRestrictions;
+
   const blockedSig =
-    validation.matchedRestrictions.length > 0
-      ? `${startDate}_${endDate}_${validation.matchedRestrictions
+    activeMatchedRestrictions.length > 0
+      ? `${startDate}_${endDate}_${activeMatchedRestrictions
           .map((r) => r.restrictionId)
           .join(',')}`
       : null;
@@ -173,20 +200,50 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
   );
 
   const blockedDatesSet = useMemo(
-    () => new Set(validation.blockedDates),
-    [validation.blockedDates]
+    () => new Set(activeBlockedDates),
+    [activeBlockedDates]
   );
 
   if (!open) return null;
 
+  const handleRetryRestrictions = async () => {
+    setSubmitError(null);
+    setRetryingRestrictions(true);
+    try {
+      if (onRefreshRestrictions) {
+        await onRefreshRestrictions();
+      } else {
+        await loadActiveRestrictionsStrict();
+      }
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRetryingRestrictions(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError(null);
+    setRuntimeBlocked(null);
+
+    if (restrictionsStatus === 'error') {
+      setSubmitError(
+        restrictionsError ||
+          'Unable to verify active leave restrictions. Please retry before submitting.'
+      );
+      return;
+    }
+    if (restrictionsStatus === 'loading') {
+      setSubmitError('Verifying active leave restrictions. Please wait a moment and try again.');
+      return;
+    }
+
     if (validation.matchedRestrictions.length > 0) {
       setDismissedPopupSig(null);
       setSubmitError(
         validation.errors[validation.errors.length - 1] ||
-          'Selected dates fall inside a restricted leave period.'
+          'You are not permitted to apply for leave during the selected dates.'
       );
       return;
     }
@@ -194,8 +251,28 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
       setSubmitError(validation.errors[0] || 'Please resolve the highlighted policy checks.');
       return;
     }
+
     setSubmitting(true);
     try {
+      // Recheck live restrictions right before submitting so cross-device updates cannot be bypassed
+      const freshRestrictions = onRefreshRestrictions
+        ? await onRefreshRestrictions()
+        : await loadActiveRestrictionsStrict();
+      const freshCheck = findRestrictedDatesForStaff(
+        validation.dates,
+        freshRestrictions,
+        staff
+      );
+      if (freshCheck.matchedRestrictions.length > 0) {
+        setRuntimeBlocked(freshCheck);
+        setDismissedPopupSig(null);
+        const primary = freshCheck.matchedRestrictions[0];
+        setSubmitError(
+          `You are not permitted to apply for leave during the selected dates. Reason: ${primary.reason}. Please select alternative dates.`
+        );
+        return;
+      }
+
       await onSubmit({
         leaveType,
         startDate,
@@ -205,6 +282,13 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
       });
       onClose();
     } catch (err) {
+      if (err instanceof RestrictedLeaveError) {
+        setRuntimeBlocked({
+          blockedDates: err.blockedDates,
+          matchedRestrictions: err.matchedRestrictions,
+        });
+        setDismissedPopupSig(null);
+      }
       setSubmitError(err instanceof Error ? err.message : String(err));
     } finally {
       setSubmitting(false);
@@ -281,6 +365,7 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
                 value={startDate}
                 onChange={(e) => {
                   setStartDate(e.target.value);
+                  setRuntimeBlocked(null);
                   if (e.target.value > endDate) {
                     setEndDate(e.target.value);
                   }
@@ -302,7 +387,10 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
                 type="date"
                 value={endDate}
                 min={startDate}
-                onChange={(e) => setEndDate(e.target.value)}
+                onChange={(e) => {
+                  setEndDate(e.target.value);
+                  setRuntimeBlocked(null);
+                }}
                 className="w-full min-h-[44px] sm:min-h-0 px-3 py-2.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-sm font-mono focus:outline-none focus:ring-2 focus:ring-teal-500"
                 required
               />
@@ -393,12 +481,37 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
             />
           </div>
 
-          {/* Blocking Validation Errors */}
-          {(validation.errors.length > 0 && reason.length > 0) ||
-          validation.unavailableDates.length > 0 ||
-          validation.blockedDates.length > 0 ||
-          annualUsage.remainingPeriods === 0 ||
-          submitError ? (
+          {/* Blocking Validation & Restriction Verification Alerts */}
+          {restrictionsStatus === 'error' ? (
+            <div
+              role="alert"
+              className="p-3.5 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-800 dark:text-red-200 space-y-2"
+            >
+              <p className="flex items-start gap-2 font-semibold">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" />
+                <span>
+                  {restrictionsError ||
+                    'Unable to load leave date restrictions from the server. Leave submission is paused until restrictions can be verified.'}
+                </span>
+              </p>
+              <button
+                type="button"
+                disabled={retryingRestrictions}
+                onClick={handleRetryRestrictions}
+                className="px-3 py-1.5 rounded-md border border-red-300 dark:border-red-800 bg-white dark:bg-[#07111E] text-red-700 dark:text-red-300 font-semibold hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-50"
+              >
+                {retryingRestrictions ? 'Retrying...' : 'Retry Restriction Check'}
+              </button>
+            </div>
+          ) : restrictionsStatus === 'loading' ? (
+            <div className="p-3 rounded-lg bg-slate-50 dark:bg-[#07111E] border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-300">
+              Verifying active leave date restrictions...
+            </div>
+          ) : (validation.errors.length > 0 && reason.length > 0) ||
+            validation.unavailableDates.length > 0 ||
+            activeBlockedDates.length > 0 ||
+            annualUsage.remainingPeriods === 0 ||
+            submitError ? (
             <div
               role="alert"
               className="p-3.5 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-800 dark:text-red-200 space-y-1"
@@ -440,10 +553,15 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
             </button>
             <button
               type="submit"
-              disabled={submitting || !validation.valid}
+              disabled={
+                submitting ||
+                !validation.valid ||
+                restrictionsStatus !== 'ready' ||
+                activeMatchedRestrictions.length > 0
+              }
               className="min-h-[44px] sm:min-h-0 px-4 py-2 text-xs font-semibold rounded-lg bg-teal-600 hover:bg-teal-700 text-white disabled:opacity-45 disabled:cursor-not-allowed whitespace-nowrap"
             >
-              {submitting ? 'Submitting...' : 'Submit Leave Request'}
+              {submitting ? 'Verifying & Submitting...' : 'Submit Leave Request'}
             </button>
           </div>
         </form>
@@ -451,8 +569,8 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
 
       <LeaveRestrictedPopup
         open={showRestrictedPopup}
-        blockedDates={validation.blockedDates}
-        matchedRestrictions={validation.matchedRestrictions}
+        blockedDates={activeBlockedDates}
+        matchedRestrictions={activeMatchedRestrictions}
         onClose={() => setDismissedPopupSig(blockedSig)}
       />
     </div>

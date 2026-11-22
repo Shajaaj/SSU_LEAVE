@@ -11,6 +11,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  getDocsFromServer,
   limit,
   onSnapshot,
   orderBy,
@@ -35,8 +36,24 @@ import {
   UserRole,
 } from '../types/portal';
 import { expandDateRange, getMonthMetadata } from '../utils/maldivesDate';
-import { findRestrictedDatesForStaff, formatLongDate } from '../utils/leaveRestrictions';
+import { findRestrictedDatesForStaff } from '../utils/leaveRestrictions';
 import { isValidPinFormat, isValidStaffIdFormat } from '../utils/staffAuthId';
+
+export class RestrictedLeaveError extends Error {
+  blockedDates: string[];
+  matchedRestrictions: LeaveRestriction[];
+
+  constructor(
+    message: string,
+    blockedDates: string[],
+    matchedRestrictions: LeaveRestriction[]
+  ) {
+    super(message);
+    this.name = 'RestrictedLeaveError';
+    this.blockedDates = blockedDates;
+    this.matchedRestrictions = matchedRestrictions;
+  }
+}
 
 const REMEMBERED_STAFF_ID_KEY = 'ssu_remembered_staff_id';
 
@@ -583,19 +600,83 @@ export function subscribeAuditLogs(
   );
 }
 
+function normalizeRestrictionRecord(
+  raw: Record<string, unknown>,
+  docId: string
+): LeaveRestriction {
+  const rawPrimary = Array.isArray(raw.targetStaffIds) ? raw.targetStaffIds : [];
+  const rawAltA = Array.isArray(raw.staffIds) ? raw.staffIds : [];
+  const rawAltB = Array.isArray(raw.selectedStaffIds) ? raw.selectedStaffIds : [];
+  const rawStaffList =
+    rawPrimary.length > 0 ? rawPrimary : rawAltA.length > 0 ? rawAltA : rawAltB;
+  const rawTargetNames = Array.isArray(raw.targetStaffNames) ? raw.targetStaffNames : [];
+
+  const isActiveRaw = raw.isActive;
+  const isActive =
+    typeof isActiveRaw === 'string'
+      ? isActiveRaw.trim().toLowerCase() !== 'false'
+      : isActiveRaw !== false;
+
+  return {
+    restrictionId: String(raw.restrictionId || docId),
+    startDate: String(raw.startDate || '').trim(),
+    endDate: String(raw.endDate || '').trim(),
+    targetType: (String(raw.targetType || 'all').trim().toLowerCase() as RestrictionTargetType) || 'all',
+    targetStaffIds: rawStaffList.map((v) => String(v || '').trim()).filter(Boolean),
+    targetStaffNames: rawTargetNames.map((v) => String(v || '').trim()).filter(Boolean),
+    reason: String(raw.reason || '').trim(),
+    isActive,
+    createdByStaffId: String(raw.createdByStaffId || '').trim(),
+    createdByName: String(raw.createdByName || '').trim(),
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt,
+  };
+}
+
 export async function fetchLeaveRestrictionsFromWorker(): Promise<LeaveRestriction[]> {
   const user = auth.currentUser;
-  if (!user) return [];
+  if (!user) {
+    throw new Error('Authentication required to verify leave restrictions.');
+  }
   const idToken = await user.getIdToken();
   const res = await getWorkerJson<{ ok: boolean; restrictions: LeaveRestriction[] }>(
     '/api/leave/restrictions',
     idToken
   );
-  return Array.isArray(res.restrictions) ? res.restrictions : [];
+  if (!res || !Array.isArray(res.restrictions)) {
+    throw new Error('Invalid leave restrictions response from server.');
+  }
+  return res.restrictions
+    .map((r) => normalizeRestrictionRecord(r as unknown as Record<string, unknown>, r.restrictionId))
+    .filter((r) => Boolean(r.startDate && r.endDate))
+    .sort((a, b) => b.startDate.localeCompare(a.startDate));
+}
+
+export async function loadActiveRestrictionsStrict(): Promise<LeaveRestriction[]> {
+  // Prefer Worker endpoint first because it bypasses stale client cache & permission-rule delays
+  // and reads directly from Firestore using authenticated caller identity.
+  try {
+    return await fetchLeaveRestrictionsFromWorker();
+  } catch (workerErr) {
+    try {
+      const snap = await getDocsFromServer(collection(db, 'leaveRestrictions'));
+      return snap.docs
+        .map((d) => normalizeRestrictionRecord(d.data() as Record<string, unknown>, d.id))
+        .filter((r) => Boolean(r.startDate && r.endDate))
+        .sort((a, b) => b.startDate.localeCompare(a.startDate));
+    } catch {
+      throw new Error(
+        workerErr instanceof Error && workerErr.message
+          ? `Unable to verify leave date restrictions: ${workerErr.message}`
+          : 'Unable to load leave date restrictions. Please check your connection and try again.'
+      );
+    }
+  }
 }
 
 export function subscribeLeaveRestrictions(
   onData: (restrictions: LeaveRestriction[]) => void,
+  onError: (err: Error) => void,
   onFallbackLoad?: () => void
 ): Unsubscribe {
   let active = true;
@@ -604,37 +685,31 @@ export function subscribeLeaveRestrictions(
     (snap) => {
       if (!active) return;
       const items = snap.docs
-        .map((d) => {
-          const raw = d.data() as Partial<LeaveRestriction>;
-          return {
-            restrictionId: String(raw.restrictionId || d.id),
-            startDate: String(raw.startDate || ''),
-            endDate: String(raw.endDate || ''),
-            targetType: (raw.targetType as RestrictionTargetType) || 'all',
-            targetStaffIds: Array.isArray(raw.targetStaffIds) ? raw.targetStaffIds : [],
-            targetStaffNames: Array.isArray(raw.targetStaffNames) ? raw.targetStaffNames : [],
-            reason: String(raw.reason || ''),
-            isActive: raw.isActive !== false,
-            createdByStaffId: String(raw.createdByStaffId || ''),
-            createdByName: String(raw.createdByName || ''),
-            createdAt: raw.createdAt,
-            updatedAt: raw.updatedAt,
-          } satisfies LeaveRestriction;
-        })
+        .map((d) => normalizeRestrictionRecord(d.data() as Record<string, unknown>, d.id))
         .filter((r) => Boolean(r.startDate && r.endDate))
         .sort((a, b) => b.startDate.localeCompare(a.startDate));
       onData(items);
     },
-    () => {
-      // Fallback gracefully via Cloudflare Worker when Firestore security rules are pending update
+    (snapshotErr) => {
+      // Fallback via Cloudflare Worker when Firestore security rules are pending update
       void fetchLeaveRestrictionsFromWorker()
         .then((items) => {
           if (active) {
-            onData(items);
             onFallbackLoad?.();
+            onData(items);
           }
         })
-        .catch(() => undefined);
+        .catch((workerErr) => {
+          if (active) {
+            onError(
+              workerErr instanceof Error
+                ? workerErr
+                : snapshotErr instanceof Error
+                  ? snapshotErr
+                  : new Error('Unable to load leave date restrictions.')
+            );
+          }
+        });
     }
   );
 }
@@ -726,6 +801,22 @@ export async function submitLeaveRequest(
     throw new Error(expanded.error);
   }
 
+  // Always recheck active restrictions live from server before creating a leave request or reserving slots
+  const activeRestrictions = await loadActiveRestrictionsStrict();
+  const blockedCheck = findRestrictedDatesForStaff(
+    expanded.dates,
+    activeRestrictions,
+    staff
+  );
+  if (blockedCheck.matchedRestrictions.length > 0) {
+    const primary = blockedCheck.matchedRestrictions[0];
+    throw new RestrictedLeaveError(
+      `You are not permitted to apply for leave during the selected dates. Reason: ${primary.reason}. Please select alternative dates.`,
+      blockedCheck.blockedDates,
+      blockedCheck.matchedRestrictions
+    );
+  }
+
   const idToken = await user.getIdToken(true);
   const res = await postWorkerJson<{ ok: boolean; requestId: string }>(
     '/api/leave/submit',
@@ -799,7 +890,7 @@ export async function requestLeaveModification(
       );
     }
 
-    const activeRestrictions = await fetchLeaveRestrictionsFromWorker().catch(() => []);
+    const activeRestrictions = await loadActiveRestrictionsStrict();
     const blockedCheck = findRestrictedDatesForStaff(
       exp.dates,
       activeRestrictions,
@@ -807,8 +898,10 @@ export async function requestLeaveModification(
     );
     if (blockedCheck.matchedRestrictions.length > 0) {
       const primary = blockedCheck.matchedRestrictions[0];
-      throw new Error(
-        `Leave applications are not permitted from ${formatLongDate(primary.startDate)} to ${formatLongDate(primary.endDate)}. Reason: ${primary.reason}. Please select alternative dates.`
+      throw new RestrictedLeaveError(
+        `You are not permitted to apply for leave during the selected dates. Reason: ${primary.reason}. Please select alternative dates.`,
+        blockedCheck.blockedDates,
+        blockedCheck.matchedRestrictions
       );
     }
 

@@ -846,17 +846,29 @@ function fsTimestamp(
 
 function parseLeaveRestrictionDoc(doc: FirestoreDocument): ParsedLeaveRestriction {
   const fields = doc.fields || {};
+  const primaryStaffIds = fsStringArray(fields, 'targetStaffIds');
+  const fallbackStaffIds =
+    primaryStaffIds.length > 0
+      ? primaryStaffIds
+      : fsStringArray(fields, 'staffIds').length > 0
+        ? fsStringArray(fields, 'staffIds')
+        : fsStringArray(fields, 'selectedStaffIds');
+  const isActiveField = fields.isActive;
+  const isActive =
+    isActiveField && 'stringValue' in isActiveField
+      ? isActiveField.stringValue.trim().toLowerCase() !== 'false'
+      : fsBool(fields, 'isActive', true);
   return {
     restrictionId: fsStr(fields, 'restrictionId') || fsDocId(doc.name),
-    startDate: fsStr(fields, 'startDate'),
-    endDate: fsStr(fields, 'endDate'),
-    targetType: fsStr(fields, 'targetType') || 'all',
-    targetStaffIds: fsStringArray(fields, 'targetStaffIds'),
+    startDate: fsStr(fields, 'startDate').trim(),
+    endDate: fsStr(fields, 'endDate').trim(),
+    targetType: (fsStr(fields, 'targetType') || 'all').trim().toLowerCase(),
+    targetStaffIds: fallbackStaffIds.map((id) => id.trim()).filter(Boolean),
     targetStaffNames: fsStringArray(fields, 'targetStaffNames'),
-    reason: fsStr(fields, 'reason'),
-    isActive: fsBool(fields, 'isActive', true),
-    createdByStaffId: fsStr(fields, 'createdByStaffId'),
-    createdByName: fsStr(fields, 'createdByName'),
+    reason: fsStr(fields, 'reason').trim(),
+    isActive,
+    createdByStaffId: fsStr(fields, 'createdByStaffId').trim(),
+    createdByName: fsStr(fields, 'createdByName').trim(),
     createdAt: fsTimestamp(fields, 'createdAt'),
     updatedAt: fsTimestamp(fields, 'updatedAt'),
   };
@@ -865,12 +877,19 @@ function parseLeaveRestrictionDoc(doc: FirestoreDocument): ParsedLeaveRestrictio
 function doesRestrictionApplyToStaffWorker(
   r: ParsedLeaveRestriction,
   staffId: string,
-  designation: string
+  designation: string,
+  uid = '',
+  staffName = ''
 ): boolean {
   if (!r.isActive) return false;
+  const targetType = String(r.targetType || '').trim().toLowerCase();
   const normDesig = String(designation || '').trim().toUpperCase();
-  const normId = String(staffId || '').trim().toUpperCase();
-  switch (r.targetType) {
+  const staffIdToken = normalizeStaffIdToken(staffId || '');
+  const deterministicUid = staffIdToken ? `ss_${staffIdToken}` : '';
+  const callerUidLower = String(uid || '').trim().toLowerCase();
+  const callerNameLower = String(staffName || '').trim().toLowerCase();
+
+  switch (targetType) {
     case 'all':
       return true;
     case 'assistant_officer':
@@ -882,7 +901,29 @@ function doesRestrictionApplyToStaffWorker(
     case 'officer':
       return normDesig === 'OFFICER';
     case 'selected_staff':
-      return r.targetStaffIds.some((id) => String(id || '').trim().toUpperCase() === normId);
+    case 'selectedstaff':
+    case 'specific_staff': {
+      const matched = r.targetStaffIds.some((rawEntry) => {
+        const trimmed = String(rawEntry || '').trim();
+        if (!trimmed) return false;
+        if (staffIdToken && normalizeStaffIdToken(trimmed) === staffIdToken) {
+          return true;
+        }
+        const lower = trimmed.toLowerCase();
+        if (deterministicUid && lower === deterministicUid) return true;
+        if (callerUidLower && lower === callerUidLower) return true;
+        if (callerNameLower.length >= 3 && lower === callerNameLower) return true;
+        return false;
+      });
+      if (matched) return true;
+
+      if (r.targetStaffIds.length === 0 && callerNameLower.length >= 3) {
+        return r.targetStaffNames.some(
+          (n) => String(n || '').trim().toLowerCase() === callerNameLower
+        );
+      }
+      return false;
+    }
     default:
       return false;
   }
@@ -892,19 +933,22 @@ function findBlockedDatesWorker(
   dates: string[],
   restrictions: ParsedLeaveRestriction[],
   staffId: string,
-  designation: string
+  designation: string,
+  uid = '',
+  staffName = ''
 ): { blockedDates: string[]; matched: ParsedLeaveRestriction[] } {
   const applicable = restrictions.filter((r) =>
-    doesRestrictionApplyToStaffWorker(r, staffId, designation)
+    doesRestrictionApplyToStaffWorker(r, staffId, designation, uid, staffName)
   );
   if (applicable.length === 0) return { blockedDates: [], matched: [] };
 
   const blockedSet = new Set<string>();
   const matchedMap = new Map<string, ParsedLeaveRestriction>();
   for (const d of dates) {
+    const cleanDate = String(d || '').trim();
     for (const r of applicable) {
-      if (d >= r.startDate && d <= r.endDate) {
-        blockedSet.add(d);
+      if (r.startDate && r.endDate && cleanDate >= r.startDate && cleanDate <= r.endDate) {
+        blockedSet.add(cleanDate);
         matchedMap.set(r.restrictionId, r);
       }
     }
@@ -1991,13 +2035,15 @@ async function handleSubmitLeave(request: Request, env: WorkerEnv): Promise<Resp
     dates,
     parsedRestrictions,
     caller.staffId,
-    caller.designation
+    caller.designation,
+    caller.uid,
+    caller.staffName
   );
   if (blockedCheck.matched.length > 0) {
     const primary = blockedCheck.matched[0];
     throw new HttpApiError(
       409,
-      `Leave applications are not permitted from ${formatLongDateWorker(primary.startDate)} to ${formatLongDateWorker(primary.endDate)}. Reason: ${primary.reason}. Please select alternative dates.`
+      `You are not permitted to apply for leave during the selected dates. Reason: ${primary.reason}. Please select alternative dates.`
     );
   }
 
@@ -2775,13 +2821,15 @@ async function handleProcessModification(request: Request, env: WorkerEnv): Prom
         newDates,
         restrictionDocs.map(parseLeaveRestrictionDoc),
         reqData.staffId,
-        reqData.designation
+        reqData.designation,
+        reqData.uid,
+        reqData.staffName
       );
       if (blockedCheck.matched.length > 0) {
         const primary = blockedCheck.matched[0];
         throw new HttpApiError(
           409,
-          `Requested dates fall inside a restricted period (${formatLongDateWorker(primary.startDate)} to ${formatLongDateWorker(primary.endDate)}): ${primary.reason}.`
+          `You are not permitted to apply for leave during the selected dates (${formatLongDateWorker(primary.startDate)} to ${formatLongDateWorker(primary.endDate)}). Reason: ${primary.reason}. Please select alternative dates.`
         );
       }
 
@@ -3425,11 +3473,10 @@ async function handleSaveRestriction(request: Request, env: WorkerEnv): Promise<
   if (targetType === 'selected_staff') {
     const rawList = Array.isArray(body.targetStaffIds)
       ? body.targetStaffIds
-          .filter((v): v is string => typeof v === 'string' && isValidStaffIdFormat(v.trim()))
+          .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
           .map((v) => v.trim())
       : [];
-    const deduped = Array.from(new Set(rawList));
-    if (deduped.length === 0) {
+    if (rawList.length === 0) {
       throw new HttpApiError(
         400,
         'Please select at least one staff member for Selected Staff Members restriction.'
@@ -3437,15 +3484,47 @@ async function handleSaveRestriction(request: Request, env: WorkerEnv): Promise<
     }
     const staffDocs = await fsListCollection(caller.projectId, caller.accessToken, 'staff');
     const nameMap = new Map<string, string>();
-    const canonicalMap = new Map<string, string>();
+    const canonicalByToken = new Map<string, string>();
+    const canonicalByUid = new Map<string, string>();
+    const canonicalByName = new Map<string, string>();
     for (const d of staffDocs) {
       const sid = fsStr(d.fields, 'staffId') || fsDocId(d.name);
       if (sid) {
-        canonicalMap.set(sid.toUpperCase(), sid);
-        nameMap.set(sid, fsStr(d.fields, 'fullName') || sid);
+        const tok = normalizeStaffIdToken(sid);
+        if (tok) {
+          canonicalByToken.set(tok, sid);
+          canonicalByUid.set(`ss_${tok}`, sid);
+        }
+        const authUid = fsStr(d.fields, 'authUid').trim().toLowerCase();
+        if (authUid) canonicalByUid.set(authUid, sid);
+        const fullName = fsStr(d.fields, 'fullName').trim();
+        if (fullName) canonicalByName.set(fullName.toLowerCase(), sid);
+        nameMap.set(sid, fullName || sid);
       }
     }
-    targetStaffIds = deduped.map((id) => canonicalMap.get(id.toUpperCase()) || id);
+    const seenTokens = new Set<string>();
+    const resolvedIds: string[] = [];
+    for (const rawEntry of rawList) {
+      const lower = rawEntry.toLowerCase();
+      const tok = normalizeStaffIdToken(rawEntry);
+      const canonical =
+        canonicalByToken.get(tok) ||
+        canonicalByUid.get(lower) ||
+        canonicalByName.get(lower) ||
+        (isValidStaffIdFormat(rawEntry) ? rawEntry : '');
+      if (!canonical) continue;
+      const canonicalTok = normalizeStaffIdToken(canonical);
+      if (!canonicalTok || seenTokens.has(canonicalTok)) continue;
+      seenTokens.add(canonicalTok);
+      resolvedIds.push(canonical);
+    }
+    if (resolvedIds.length === 0) {
+      throw new HttpApiError(
+        400,
+        'Selected staff members could not be matched to valid Staff IDs.'
+      );
+    }
+    targetStaffIds = resolvedIds;
     targetStaffNames = targetStaffIds.map((id) => nameMap.get(id) || id);
   }
 

@@ -32,6 +32,7 @@ import {
   clearAllLeaveRecords,
   deleteLeaveRestriction,
   fetchLeaveRestrictionsFromWorker,
+  loadActiveRestrictionsStrict,
   logoutSession,
   processLeaveModification,
   rejectLeaveRequest,
@@ -115,6 +116,10 @@ export default function App() {
   >({});
   const [liveAuditLogs, setLiveAuditLogs] = useState<AuditLog[]>([]);
   const [liveRestrictions, setLiveRestrictions] = useState<LeaveRestriction[]>([]);
+  const [restrictionsStatus, setRestrictionsStatus] = useState<'loading' | 'ready' | 'error'>(
+    'loading'
+  );
+  const [restrictionsError, setRestrictionsError] = useState<string | null>(null);
   const [loadingRequests, setLoadingRequests] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const syncedPendingRef = useRef(false);
@@ -158,6 +163,8 @@ export default function App() {
     setLiveCapacityDetailsMap({});
     setLiveAuditLogs([]);
     setLiveRestrictions([]);
+    setRestrictionsStatus('loading');
+    setRestrictionsError(null);
     setLoadingRequests(false);
     setSettingsLoaded(false);
     syncedPendingRef.current = false;
@@ -239,6 +246,12 @@ export default function App() {
       subscribeLeaveRestrictions(
         (items) => {
           setLiveRestrictions(items);
+          setRestrictionsStatus('ready');
+          setRestrictionsError(null);
+        },
+        (err) => {
+          setRestrictionsStatus('error');
+          setRestrictionsError(err.message);
         },
         () => {
           restrictionsFallbackRef.current = true;
@@ -353,10 +366,29 @@ export default function App() {
     [activeAllRequests]
   );
 
+  const refreshRestrictions = useCallback(async (): Promise<LeaveRestriction[]> => {
+    try {
+      const items = await loadActiveRestrictionsStrict();
+      setLiveRestrictions(items);
+      setRestrictionsStatus('ready');
+      setRestrictionsError(null);
+      return items;
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Unable to load leave date restrictions. Please try again.';
+      setRestrictionsStatus('error');
+      setRestrictionsError(msg);
+      throw err instanceof Error ? err : new Error(msg);
+    }
+  }, []);
+
   const handleOpenNewRequest = (start?: string, end?: string) => {
     setPrefillStart(start);
     setPrefillEnd(end);
     setNewReqModalOpen(true);
+    void refreshRestrictions().catch(() => undefined);
   };
 
   // Keep activeView authorized if role changes in real time
@@ -751,6 +783,9 @@ export default function App() {
         pendingDemandMap={pendingDemandMap}
         settings={liveSettings}
         restrictions={liveRestrictions}
+        restrictionsStatus={restrictionsStatus}
+        restrictionsError={restrictionsError}
+        onRefreshRestrictions={refreshRestrictions}
         initialStartDate={prefillStart}
         initialEndDate={prefillEnd}
         onSubmit={handleSubmitLeave}

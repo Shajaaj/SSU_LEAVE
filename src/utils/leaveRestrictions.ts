@@ -4,6 +4,7 @@ import {
   StaffProfile,
 } from '../types/portal';
 import { formatDisplayDate } from './maldivesDate';
+import { normalizeStaffIdToken } from './staffAuthId';
 
 const LONG_MONTHS = [
   'January',
@@ -39,15 +40,24 @@ export function formatLongDate(dateKey: string): string {
   return `${String(d).padStart(2, '0')} ${monthName} ${y}`;
 }
 
+export type RestrictionStaffIdentity = Pick<StaffProfile, 'staffId' | 'designation'> & {
+  authUid?: string;
+  fullName?: string;
+};
+
 export function doesRestrictionApplyToStaff(
   restriction: LeaveRestriction,
-  staff: Pick<StaffProfile, 'staffId' | 'designation'>
+  staff: RestrictionStaffIdentity
 ): boolean {
   if (!restriction.isActive) return false;
+  const targetType = String(restriction.targetType || '').trim().toLowerCase();
   const designation = String(staff.designation || '').trim().toUpperCase();
-  const staffIdNorm = String(staff.staffId || '').trim().toUpperCase();
+  const staffIdToken = normalizeStaffIdToken(String(staff.staffId || ''));
+  const staffDeterministicUid = staffIdToken ? `ss_${staffIdToken}` : '';
+  const staffAuthUid = String(staff.authUid || '').trim().toLowerCase();
+  const staffFullName = String(staff.fullName || '').trim().toLowerCase();
 
-  switch (restriction.targetType) {
+  switch (targetType) {
     case 'all':
       return true;
     case 'assistant_officer':
@@ -59,9 +69,33 @@ export function doesRestrictionApplyToStaff(
     case 'officer':
       return designation === 'OFFICER';
     case 'selected_staff':
-      return (restriction.targetStaffIds || []).some(
-        (id) => String(id || '').trim().toUpperCase() === staffIdNorm
-      );
+    case 'selectedstaff':
+    case 'specific_staff': {
+      const targetIds = Array.isArray(restriction.targetStaffIds)
+        ? restriction.targetStaffIds
+        : [];
+      const matchedById = targetIds.some((rawEntry) => {
+        const trimmed = String(rawEntry || '').trim();
+        if (!trimmed) return false;
+        if (staffIdToken && normalizeStaffIdToken(trimmed) === staffIdToken) {
+          return true;
+        }
+        const lower = trimmed.toLowerCase();
+        if (staffDeterministicUid && lower === staffDeterministicUid) return true;
+        if (staffAuthUid && lower === staffAuthUid) return true;
+        if (staffFullName.length >= 3 && lower === staffFullName) return true;
+        return false;
+      });
+      if (matchedById) return true;
+
+      // Backwards compatibility only if a legacy restriction saved names with no targetStaffIds
+      if (targetIds.length === 0 && staffFullName.length >= 3) {
+        return (restriction.targetStaffNames || []).some(
+          (n) => String(n || '').trim().toLowerCase() === staffFullName
+        );
+      }
+      return false;
+    }
     default:
       return false;
   }
@@ -70,11 +104,14 @@ export function doesRestrictionApplyToStaff(
 export function getActiveRestrictionsForDate(
   dateKey: string,
   restrictions: LeaveRestriction[],
-  staff?: Pick<StaffProfile, 'staffId' | 'designation'>
+  staff?: RestrictionStaffIdentity
 ): LeaveRestriction[] {
+  const targetDate = String(dateKey || '').trim();
   return restrictions.filter((r) => {
     if (!r.isActive) return false;
-    if (dateKey < r.startDate || dateKey > r.endDate) return false;
+    const start = String(r.startDate || '').trim();
+    const end = String(r.endDate || '').trim();
+    if (!start || !end || targetDate < start || targetDate > end) return false;
     if (!staff) return true;
     return doesRestrictionApplyToStaff(r, staff);
   });
@@ -83,7 +120,7 @@ export function getActiveRestrictionsForDate(
 export function findRestrictedDatesForStaff(
   dates: string[],
   restrictions: LeaveRestriction[],
-  staff: Pick<StaffProfile, 'staffId' | 'designation'>
+  staff: RestrictionStaffIdentity
 ): {
   blockedDates: string[];
   matchedRestrictions: LeaveRestriction[];
@@ -101,9 +138,12 @@ export function findRestrictedDatesForStaff(
   const matchedMap = new Map<string, LeaveRestriction>();
 
   for (const dateKey of dates) {
+    const cleanDate = String(dateKey || '').trim();
     for (const r of applicable) {
-      if (dateKey >= r.startDate && dateKey <= r.endDate) {
-        blockedSet.add(dateKey);
+      const start = String(r.startDate || '').trim();
+      const end = String(r.endDate || '').trim();
+      if (start && end && cleanDate >= start && cleanDate <= end) {
+        blockedSet.add(cleanDate);
         matchedMap.set(r.restrictionId, r);
       }
     }
@@ -121,7 +161,7 @@ export function formatRestrictionTargetLabel(
   restriction: LeaveRestriction,
   profiles: StaffProfile[] = []
 ): string {
-  switch (restriction.targetType) {
+  switch (String(restriction.targetType || '').trim().toLowerCase()) {
     case 'all':
       return 'All Staff';
     case 'assistant_officer':
@@ -132,13 +172,19 @@ export function formatRestrictionTargetLabel(
       return 'Executives';
     case 'officer':
       return 'Officers';
-    case 'selected_staff': {
+    case 'selected_staff':
+    case 'selectedstaff':
+    case 'specific_staff': {
       const ids = restriction.targetStaffIds || [];
       if (ids.length === 0) return 'Selected Staff (0)';
-      const nameById = new Map(profiles.map((p) => [p.staffId, p.fullName]));
+      const profileByToken = new Map(
+        profiles.map((p) => [normalizeStaffIdToken(p.staffId), p])
+      );
       const labels = ids.map((id, idx) => {
-        const name = nameById.get(id) || restriction.targetStaffNames?.[idx];
-        return name ? `${id} (${name})` : id;
+        const profile = profileByToken.get(normalizeStaffIdToken(id));
+        const displayId = profile?.staffId || id;
+        const name = profile?.fullName || restriction.targetStaffNames?.[idx];
+        return name ? `${displayId} (${name})` : displayId;
       });
       if (labels.length <= 2) return labels.join(', ');
       return `${labels.slice(0, 2).join(', ')} +${labels.length - 2} more`;

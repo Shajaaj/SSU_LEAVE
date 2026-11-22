@@ -177,7 +177,12 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
     setRstStartDate(r.startDate);
     setRstEndDate(r.endDate);
     setRstTargetType(r.targetType);
-    setRstSelectedStaffIds(r.targetStaffIds || []);
+    const canonicalSelected = (r.targetStaffIds || []).map((rawId) => {
+      const tok = normalizeStaffIdToken(rawId);
+      const found = profiles.find((p) => normalizeStaffIdToken(p.staffId) === tok);
+      return found ? found.staffId : rawId;
+    });
+    setRstSelectedStaffIds(Array.from(new Set(canonicalSelected)));
     setRstStaffSearch('');
     setRstReason(r.reason);
     setRstIsActive(r.isActive);
@@ -185,9 +190,18 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
   };
 
   const toggleStaffSelection = (staffId: string) => {
-    setRstSelectedStaffIds((prev) =>
-      prev.includes(staffId) ? prev.filter((id) => id !== staffId) : [...prev, staffId]
+    const targetToken = normalizeStaffIdToken(staffId);
+    const canonicalProfile = profiles.find(
+      (p) => normalizeStaffIdToken(p.staffId) === targetToken
     );
+    const canonicalId = canonicalProfile ? canonicalProfile.staffId : staffId.trim();
+    setRstSelectedStaffIds((prev) => {
+      const exists = prev.some((id) => normalizeStaffIdToken(id) === targetToken);
+      if (exists) {
+        return prev.filter((id) => normalizeStaffIdToken(id) !== targetToken);
+      }
+      return [...prev, canonicalId];
+    });
   };
 
   const handleSubmitRestriction = async (e: React.FormEvent) => {
@@ -623,7 +637,10 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
                 {rstSelectedStaffIds.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
                     {rstSelectedStaffIds.map((sid) => {
-                      const match = profiles.find((p) => p.staffId === sid);
+                      const tok = normalizeStaffIdToken(sid);
+                      const match = profiles.find(
+                        (p) => normalizeStaffIdToken(p.staffId) === tok
+                      );
                       return (
                         <span
                           key={sid}
@@ -665,7 +682,10 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
                     <p className="p-3 text-center text-slate-500">No matching staff found.</p>
                   ) : (
                     filteredStaffForRestriction.map((p) => {
-                      const checked = rstSelectedStaffIds.includes(p.staffId);
+                      const pToken = normalizeStaffIdToken(p.staffId);
+                      const checked = rstSelectedStaffIds.some(
+                        (id) => normalizeStaffIdToken(id) === pToken
+                      );
                       return (
                         <label
                           key={p.staffId}

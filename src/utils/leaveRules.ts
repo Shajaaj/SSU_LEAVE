@@ -313,7 +313,7 @@ export function validateLeaveSubmission(params: {
   if (restrictionCheck.matchedRestrictions.length > 0) {
     const primary = restrictionCheck.matchedRestrictions[0];
     errors.push(
-      `Leave applications are not permitted from ${formatLongDate(primary.startDate)} to ${formatLongDate(primary.endDate)}. Reason: ${primary.reason}. Please select alternative dates.`
+      `You are not permitted to apply for leave during the selected dates (${formatLongDate(primary.startDate)} to ${formatLongDate(primary.endDate)}). Reason: ${primary.reason}. Please select alternative dates.`
     );
   }
 

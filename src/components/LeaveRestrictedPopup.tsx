@@ -61,12 +61,18 @@ export const LeaveRestrictedPopup: React.FC<LeaveRestrictedPopupProps> = ({
         </div>
 
         <div className="p-4 rounded-lg bg-red-50/80 dark:bg-red-950/35 border border-red-200 dark:border-red-900/50 space-y-3 text-xs sm:text-sm text-slate-800 dark:text-slate-100">
+          <p className="leading-relaxed font-semibold text-red-900 dark:text-red-100">
+            You are not permitted to apply for leave during the selected dates.
+          </p>
           {matchedRestrictions.length === 1 ? (
             <>
-              <p className="leading-relaxed font-medium">
-                {primary.startDate === primary.endDate
-                  ? `Leave applications are not permitted on ${formatLongDate(primary.startDate)}.`
-                  : `Leave applications are not permitted from ${formatLongDate(primary.startDate)} to ${formatLongDate(primary.endDate)}.`}
+              <p className="text-xs text-slate-700 dark:text-slate-300">
+                Restricted period:{' '}
+                <span className="font-semibold">
+                  {primary.startDate === primary.endDate
+                    ? formatLongDate(primary.startDate)
+                    : `${formatLongDate(primary.startDate)} to ${formatLongDate(primary.endDate)}`}
+                </span>
               </p>
               <p className="text-xs sm:text-sm">
                 <span className="font-bold text-slate-900 dark:text-white">Reason:</span>{' '}
@@ -75,7 +81,7 @@ export const LeaveRestrictedPopup: React.FC<LeaveRestrictedPopupProps> = ({
             </>
           ) : (
             <div className="space-y-2.5">
-              <p className="font-medium leading-relaxed">
+              <p className="font-medium leading-relaxed text-xs">
                 Your selected range overlaps {matchedRestrictions.length} restricted leave periods:
               </p>
               <ul className="space-y-2">
