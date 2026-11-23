@@ -346,9 +346,14 @@ async function createFirebaseCustomToken(
   return signRs256Jwt(payload, sa.private_key);
 }
 
-async function getGoogleAccessToken(sa: ServiceAccountJson): Promise<string> {
+async function getGoogleAccessToken(
+  sa: ServiceAccountJson,
+  forceRefresh = false
+): Promise<string> {
   const now = Date.now();
-  if (
+  if (forceRefresh) {
+    cachedAccessToken = null;
+  } else if (
     cachedAccessToken &&
     cachedAccessToken.clientEmail === sa.client_email &&
     cachedAccessToken.expiresAtMs > now + 60_000
@@ -550,24 +555,194 @@ function fsInt(
   return fallback;
 }
 
+class FirestoreRestError extends Error {
+  operation: string;
+  target: string;
+  httpStatus: number;
+  googleCode?: number;
+  googleStatus?: string;
+  safeMessage: string;
+
+  constructor(params: {
+    operation: string;
+    target: string;
+    httpStatus: number;
+    googleCode?: number;
+    googleStatus?: string;
+    safeMessage: string;
+  }) {
+    const codeLabel = params.googleStatus
+      ? `${params.httpStatus} ${params.googleStatus}`
+      : String(params.httpStatus);
+    super(
+      `Firestore ${params.operation} ${params.target} failed (${codeLabel}): ${params.safeMessage}`
+    );
+    this.name = 'FirestoreRestError';
+    this.operation = params.operation;
+    this.target = params.target;
+    this.httpStatus = params.httpStatus;
+    this.googleCode = params.googleCode;
+    this.googleStatus = params.googleStatus;
+    this.safeMessage = params.safeMessage;
+  }
+}
+
+function sanitizeErrorText(raw: string, maxLen = 280): string {
+  const cleaned = String(raw || '')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [REDACTED]')
+    .replace(/(access_token|token|key|assertion|private_key)=([^&\s]+)/gi, '$1=[REDACTED]')
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[PRIVATE_KEY_REDACTED]')
+    .replace(/\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]+)?\b/g, '[JWT_REDACTED]')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return 'Upstream Firestore error.';
+  return cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 3)}...` : cleaned;
+}
+
+function parseGoogleApiErrorPayload(rawText: string): {
+  googleCode?: number;
+  googleStatus?: string;
+  message?: string;
+} {
+  if (!rawText) return {};
+  try {
+    const parsed = JSON.parse(rawText) as unknown;
+    const obj = Array.isArray(parsed) ? parsed[0] : parsed;
+    const errObj =
+      obj && typeof obj === 'object' && 'error' in obj
+        ? (obj as { error?: unknown }).error
+        : obj;
+    if (!errObj || typeof errObj !== 'object') return {};
+
+    const record = errObj as {
+      code?: unknown;
+      status?: unknown;
+      message?: unknown;
+      details?: Array<{ reason?: unknown }>;
+    };
+    const googleCode = typeof record.code === 'number' ? record.code : undefined;
+    const baseStatus = typeof record.status === 'string' ? record.status.trim() : undefined;
+    const detailReason = Array.isArray(record.details)
+      ? record.details.find((d) => typeof d?.reason === 'string' && d.reason.trim())?.reason
+      : undefined;
+    const reasonStr = typeof detailReason === 'string' ? detailReason.trim() : undefined;
+    const googleStatus =
+      baseStatus && reasonStr && reasonStr !== baseStatus
+        ? `${baseStatus}/${reasonStr}`
+        : baseStatus || reasonStr;
+    const message = typeof record.message === 'string' ? record.message : undefined;
+    return { googleCode, googleStatus, message };
+  } catch {
+    return {};
+  }
+}
+
+async function parseFirestoreErrorResponse(
+  res: Response,
+  operation: string,
+  target: string,
+  prefetchedText?: string
+): Promise<FirestoreRestError> {
+  let rawText = prefetchedText ?? '';
+  if (prefetchedText === undefined) {
+    try {
+      rawText = await res.text();
+    } catch {
+      rawText = '';
+    }
+  }
+  const parsed = parseGoogleApiErrorPayload(rawText);
+  const safeMessage = sanitizeErrorText(
+    parsed.message || rawText || res.statusText || `HTTP ${res.status}`
+  );
+  return new FirestoreRestError({
+    operation,
+    target,
+    httpStatus: res.status,
+    googleCode: parsed.googleCode,
+    googleStatus: parsed.googleStatus,
+    safeMessage,
+  });
+}
+
+async function firestoreFetch(
+  url: string,
+  init: RequestInit,
+  operation: string,
+  target: string
+): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    const rawMsg = err instanceof Error ? err.message : String(err);
+    throw new FirestoreRestError({
+      operation,
+      target,
+      httpStatus: 0,
+      googleStatus: 'FETCH_ERROR',
+      safeMessage: sanitizeErrorText(rawMsg || 'Network request to Firestore failed.'),
+    });
+  }
+}
+
+async function parseFirestoreJson<T>(
+  res: Response,
+  operation: string,
+  target: string
+): Promise<T> {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new FirestoreRestError({
+      operation,
+      target,
+      httpStatus: res.status,
+      googleStatus: 'INVALID_RESPONSE',
+      safeMessage: 'Firestore returned a non-JSON response payload.',
+    });
+  }
+}
+
 async function fsGetDoc(
   projectId: string,
   accessToken: string,
   docPath: string
 ): Promise<FirestoreDocument | null> {
-  const url = `${firestoreBaseUrl(projectId)}/${docPath
+  const cleanPath = docPath
     .split('/')
+    .map((seg) => seg.trim())
+    .filter(Boolean)
     .map(encodeURIComponent)
-    .join('/')}`;
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Firestore GET ${docPath} failed (${res.status}): ${errText}`);
+    .join('/');
+  const url = `${firestoreBaseUrl(projectId)}/${cleanPath}`;
+  const res = await firestoreFetch(
+    url,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+    'GET',
+    docPath
+  );
+  if (res.status === 404) {
+    let errText = '';
+    try {
+      errText = await res.text();
+    } catch {
+      errText = '';
+    }
+    const parsed = parseGoogleApiErrorPayload(errText);
+    const detail = parsed.message || errText;
+    // Differentiate missing project/database 404 from normal missing document 404
+    const isMissingDatabaseOrProject =
+      /(?:database|project)\s+.*(?:does not exist|not found)/i.test(detail) &&
+      !/Document\s+".*"\s+not found/i.test(detail);
+    if (isMissingDatabaseOrProject) {
+      throw await parseFirestoreErrorResponse(res, 'GET', docPath, errText);
+    }
+    return null;
   }
-  return (await res.json()) as FirestoreDocument;
+  if (!res.ok) {
+    throw await parseFirestoreErrorResponse(res, 'GET', docPath);
+  }
+  return parseFirestoreJson<FirestoreDocument>(res, 'GET', docPath);
 }
 
 async function fsListCollection(
@@ -582,17 +757,19 @@ async function fsListCollection(
     const params = new URLSearchParams({ pageSize: '300' });
     if (pageToken) params.set('pageToken', pageToken);
     const url = `${firestoreBaseUrl(projectId)}/${encodeURIComponent(collectionName)}?${params.toString()}`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
+    const res = await firestoreFetch(
+      url,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+      'LIST',
+      collectionName
+    );
     if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Firestore LIST ${collectionName} failed (${res.status}): ${errText}`);
+      throw await parseFirestoreErrorResponse(res, 'LIST', collectionName);
     }
-    const body = (await res.json()) as {
+    const body = await parseFirestoreJson<{
       documents?: FirestoreDocument[];
       nextPageToken?: string;
-    };
+    }>(res, 'LIST', collectionName);
     if (body.documents) docs.push(...body.documents);
     pageToken = body.nextPageToken || '';
   } while (pageToken);
@@ -611,21 +788,28 @@ async function fsPatchDoc(
   for (const fp of fieldPaths || Object.keys(fields)) {
     params.append('updateMask.fieldPaths', fp);
   }
-  const url = `${firestoreBaseUrl(projectId)}/${docPath
+  const cleanPath = docPath
     .split('/')
+    .map((seg) => seg.trim())
+    .filter(Boolean)
     .map(encodeURIComponent)
-    .join('/')}?${params.toString()}`;
-  const res = await fetch(url, {
-    method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
+    .join('/');
+  const url = `${firestoreBaseUrl(projectId)}/${cleanPath}?${params.toString()}`;
+  const res = await firestoreFetch(
+    url,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fields }),
     },
-    body: JSON.stringify({ fields }),
-  });
+    'PATCH',
+    docPath
+  );
   if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Firestore PATCH ${docPath} failed (${res.status}): ${errText}`);
+    throw await parseFirestoreErrorResponse(res, 'PATCH', docPath);
   }
 }
 
@@ -637,17 +821,22 @@ async function fsCreateDoc(
   fields: Record<string, FirestoreValue>
 ): Promise<void> {
   const url = `${firestoreBaseUrl(projectId)}/${encodeURIComponent(collectionName)}?documentId=${encodeURIComponent(documentId)}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
+  const target = `${collectionName}/${documentId}`;
+  const res = await firestoreFetch(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fields }),
     },
-    body: JSON.stringify({ fields }),
-  });
+    'CREATE',
+    target
+  );
   if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Firestore CREATE ${collectionName}/${documentId} failed (${res.status}): ${errText}`);
+    throw await parseFirestoreErrorResponse(res, 'CREATE', target);
   }
 }
 
@@ -657,6 +846,8 @@ async function findAuthorizedStaffDoc(
   rawStaffId: string
 ): Promise<{ staffId: string; docId: string; doc: FirestoreDocument } | null> {
   const trimmed = rawStaffId.trim();
+  if (!trimmed) return null;
+
   const exact = await fsGetDoc(projectId, accessToken, `staff/${trimmed}`);
   if (exact) {
     const docId = fsDocId(exact.name) || trimmed;
@@ -1116,21 +1307,35 @@ async function fsBeginTransaction(
   accessToken: string
 ): Promise<string> {
   const url = `${firestoreBaseUrl(projectId)}:beginTransaction`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
+  const res = await firestoreFetch(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ options: { readWrite: {} } }),
     },
-    body: JSON.stringify({ options: { readWrite: {} } }),
-  });
+    'BEGIN_TRANSACTION',
+    projectId
+  );
   if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Firestore beginTransaction failed (${res.status}): ${errText}`);
+    throw await parseFirestoreErrorResponse(res, 'BEGIN_TRANSACTION', projectId);
   }
-  const body = (await res.json()) as { transaction?: string };
+  const body = await parseFirestoreJson<{ transaction?: string }>(
+    res,
+    'BEGIN_TRANSACTION',
+    projectId
+  );
   if (!body.transaction) {
-    throw new Error('Firestore beginTransaction returned no transaction token.');
+    throw new FirestoreRestError({
+      operation: 'BEGIN_TRANSACTION',
+      target: projectId,
+      httpStatus: res.status,
+      googleStatus: 'INVALID_RESPONSE',
+      safeMessage: 'Firestore beginTransaction returned no transaction token.',
+    });
   }
   return body.transaction;
 }
@@ -1165,26 +1370,31 @@ async function fsBatchGetDocs(
   docPaths.forEach((p, i) => pathByFullName.set(fullNames[i], p));
 
   const url = `${firestoreBaseUrl(projectId)}:batchGet`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
+  const target = `batchGet(${docPaths.length})`;
+  const res = await firestoreFetch(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        documents: fullNames,
+        ...(transaction ? { transaction } : {}),
+      }),
     },
-    body: JSON.stringify({
-      documents: fullNames,
-      ...(transaction ? { transaction } : {}),
-    }),
-  });
+    'BATCH_GET',
+    target
+  );
   if (!res.ok) {
-    const errText = await res.text();
     if (res.status === 409) {
       throw new HttpApiError(409, 'ABORTED: Transaction conflict during read.');
     }
-    throw new Error(`Firestore batchGet failed (${res.status}): ${errText}`);
+    throw await parseFirestoreErrorResponse(res, 'BATCH_GET', target);
   }
 
-  const rows = (await res.json()) as BatchGetResponseItem[];
+  const rows = await parseFirestoreJson<BatchGetResponseItem[]>(res, 'BATCH_GET', target);
   for (const row of rows) {
     if (row.found?.name) {
       const p = pathByFullName.get(row.found.name);
@@ -1204,25 +1414,33 @@ async function fsRunQuery(
   transaction?: string
 ): Promise<FirestoreDocument[]> {
   const url = `${firestoreBaseUrl(projectId)}:runQuery`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
+  const res = await firestoreFetch(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        structuredQuery,
+        ...(transaction ? { transaction } : {}),
+      }),
     },
-    body: JSON.stringify({
-      structuredQuery,
-      ...(transaction ? { transaction } : {}),
-    }),
-  });
+    'RUN_QUERY',
+    projectId
+  );
   if (!res.ok) {
-    const errText = await res.text();
     if (res.status === 409) {
       throw new HttpApiError(409, 'ABORTED: Transaction conflict during query.');
     }
-    throw new Error(`Firestore runQuery failed (${res.status}): ${errText}`);
+    throw await parseFirestoreErrorResponse(res, 'RUN_QUERY', projectId);
   }
-  const rows = (await res.json()) as Array<{ document?: FirestoreDocument }>;
+  const rows = await parseFirestoreJson<Array<{ document?: FirestoreDocument }>>(
+    res,
+    'RUN_QUERY',
+    projectId
+  );
   const docs: FirestoreDocument[] = [];
   for (const row of rows) {
     if (row.document) docs.push(row.document);
@@ -1237,23 +1455,29 @@ async function fsCommitWrites(
   transaction?: string
 ): Promise<void> {
   const url = `${firestoreBaseUrl(projectId)}:commit`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
+  const target = `commit(${writes.length})`;
+  const res = await firestoreFetch(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        writes,
+        ...(transaction ? { transaction } : {}),
+      }),
     },
-    body: JSON.stringify({
-      writes,
-      ...(transaction ? { transaction } : {}),
-    }),
-  });
+    'COMMIT',
+    target
+  );
   if (!res.ok) {
-    const errText = await res.text();
+    const errText = await res.text().catch(() => '');
     if (res.status === 409 || errText.includes('ABORTED') || errText.includes('ALREADY_EXISTS')) {
-      throw new HttpApiError(409, `ABORTED: ${errText}`);
+      throw new HttpApiError(409, `ABORTED: ${sanitizeErrorText(errText)}`);
     }
-    throw new Error(`Firestore commit failed (${res.status}): ${errText}`);
+    throw await parseFirestoreErrorResponse(res, 'COMMIT', target, errText);
   }
 }
 
@@ -1515,12 +1739,28 @@ class LoginStageError extends Error {
   stage: LoginStage;
   status: number;
   publicMessage: string;
+  firestoreHttpStatus?: number;
+  firestoreCode?: string;
+  firestoreOperation?: string;
 
-  constructor(stage: LoginStage, publicMessage: string, causeMessage?: string, status = 500) {
+  constructor(
+    stage: LoginStage,
+    publicMessage: string,
+    causeMessage?: string,
+    status = 500,
+    details?: {
+      firestoreHttpStatus?: number;
+      firestoreCode?: string;
+      firestoreOperation?: string;
+    }
+  ) {
     super(causeMessage || publicMessage);
     this.stage = stage;
     this.status = status;
     this.publicMessage = publicMessage;
+    this.firestoreHttpStatus = details?.firestoreHttpStatus;
+    this.firestoreCode = details?.firestoreCode;
+    this.firestoreOperation = details?.firestoreOperation;
   }
 }
 
@@ -1560,13 +1800,33 @@ function summarizeSafeLoginError(
       saProjectId && saProjectId !== projectId
         ? ` (Service account project "${saProjectId}" differs from configured project "${projectId}".)`
         : '';
+
+    if (err instanceof FirestoreRestError) {
+      const codeStr = err.googleStatus || (err.googleCode ? String(err.googleCode) : '');
+      const statusLabel = codeStr ? `${err.httpStatus} ${codeStr}` : String(err.httpStatus);
+
+      if (err.httpStatus === 401 || err.googleStatus?.includes('UNAUTHENTICATED')) {
+        return `Firestore authentication failed (${statusLabel}) during ${stage} on project "${projectId}"${mismatchNote}: ${err.safeMessage}`;
+      }
+      if (err.httpStatus === 403 || err.googleStatus?.includes('PERMISSION_DENIED')) {
+        return `Firestore access denied (${statusLabel}) during ${stage} on project "${projectId}"${mismatchNote}: ${err.safeMessage}`;
+      }
+      if (err.httpStatus === 404 || err.googleStatus?.includes('NOT_FOUND')) {
+        return `Firestore database "(default)" or collection unreachable (${statusLabel}) during ${stage} on project "${projectId}"${mismatchNote}: ${err.safeMessage}`;
+      }
+      if (err.httpStatus === 0) {
+        return `Firestore network error (${err.googleStatus || 'FETCH_ERROR'}) during ${stage} on project "${projectId}"${mismatchNote}: ${err.safeMessage}`;
+      }
+      return `Firestore upstream error (${statusLabel}) during ${stage} on project "${projectId}"${mismatchNote}: ${err.safeMessage}`;
+    }
+
     if (rawMsg.includes('(403)')) {
-      return `Firestore access denied during ${stage} on project "${projectId}".${mismatchNote} Verify service account IAM permissions.`;
+      return `Firestore access denied (403) during ${stage} on project "${projectId}".${mismatchNote} Verify service account IAM permissions.`;
     }
     if (rawMsg.includes('(404)')) {
-      return `Firestore database "(default)" or collection unreachable during ${stage} on project "${projectId}".${mismatchNote}`;
+      return `Firestore database "(default)" or collection unreachable (404) during ${stage} on project "${projectId}".${mismatchNote}`;
     }
-    return `Firestore service error during ${stage} on project "${projectId}".${mismatchNote}`;
+    return `Firestore service error during ${stage} on project "${projectId}"${mismatchNote}: ${sanitizeErrorText(rawMsg)}`;
   }
 
   if (stage === 'verify_pin_hash') {
@@ -1592,7 +1852,20 @@ async function runLoginStage<T>(
       throw err;
     }
     const errName = err instanceof Error ? err.name : typeof err;
-    const errMessage = err instanceof Error ? err.message : String(err);
+    const errMessage =
+      err instanceof FirestoreRestError
+        ? err.safeMessage
+        : sanitizeErrorText(err instanceof Error ? err.message : String(err), 400);
+    const firestoreDetails =
+      err instanceof FirestoreRestError
+        ? {
+            firestoreOperation: err.operation,
+            firestoreTarget: err.target,
+            firestoreHttpStatus: err.httpStatus,
+            firestoreCode: err.googleStatus || (err.googleCode ? String(err.googleCode) : undefined),
+          }
+        : {};
+
     console.error('[auth/login] Stage error:', {
       stage,
       projectId: context.projectId,
@@ -1601,17 +1874,60 @@ async function runLoginStage<T>(
         context.saProjectId && context.saProjectId !== context.projectId
       ),
       staffId: context.staffId || null,
+      ...firestoreDetails,
       errorName: errName,
-      errorMessage: errMessage.slice(0, 400),
+      errorMessage: errMessage,
     });
+
     const publicMessage = summarizeSafeLoginError(
       stage,
       err,
       context.projectId,
       context.saProjectId
     );
-    throw new LoginStageError(stage, publicMessage, errMessage, 500);
+    throw new LoginStageError(stage, publicMessage, errMessage, 500, {
+      firestoreHttpStatus: firestoreDetails.firestoreHttpStatus,
+      firestoreCode: firestoreDetails.firestoreCode,
+      firestoreOperation: firestoreDetails.firestoreOperation,
+    });
   }
+}
+
+async function runFirestoreWithTokenRetry<T>(
+  sa: ServiceAccountJson,
+  currentToken: string,
+  stage: LoginStage,
+  context: { projectId: string; saProjectId?: string; staffId?: string },
+  fn: (token: string) => Promise<T>
+): Promise<{ result: T; token: string }> {
+  let tokenToUse = currentToken;
+  return {
+    result: await runLoginStage(stage, context, async () => {
+      try {
+        return await fn(tokenToUse);
+      } catch (err) {
+        if (
+          err instanceof FirestoreRestError &&
+          (err.httpStatus === 401 || err.googleStatus?.includes('UNAUTHENTICATED'))
+        ) {
+          console.warn(
+            '[auth/login] Firestore returned 401 UNAUTHENTICATED; refreshing OAuth token and retrying once.',
+            {
+              stage,
+              projectId: context.projectId,
+              operation: err.operation,
+              target: err.target,
+              safeMessage: err.safeMessage,
+            }
+          );
+          tokenToUse = await getGoogleAccessToken(sa, true);
+          return await fn(tokenToUse);
+        }
+        throw err;
+      }
+    }),
+    token: tokenToUse,
+  };
 }
 
 async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> {
@@ -1652,18 +1968,22 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
     });
   }
 
-  const accessToken = await runLoginStage(
+  let activeAccessToken = await runLoginStage(
     'get_access_token',
     { projectId, saProjectId: sa.project_id },
     () => getGoogleAccessToken(sa)
   );
 
   // 1. Verify Staff ID already exists as an authorized staff record (never auto-register unknown IDs)
-  const found = await runLoginStage(
+  const lookupStep = await runFirestoreWithTokenRetry(
+    sa,
+    activeAccessToken,
     'lookup_staff_record',
     { projectId, saProjectId: sa.project_id, staffId: rawStaffId },
-    () => findAuthorizedStaffDoc(projectId, accessToken, rawStaffId)
+    (token) => findAuthorizedStaffDoc(projectId, token, rawStaffId)
   );
+  activeAccessToken = lookupStep.token;
+  const found = lookupStep.result;
   if (!found) {
     return jsonResponse({ error: 'Invalid Staff ID or PIN.' }, 401);
   }
@@ -1679,14 +1999,16 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
 
   // 2. Read server-only hashed PIN credential from staffPinSecrets/{staffId} (with docId fallback)
   let secretDocId = staffId;
-  const secretDoc = await runLoginStage(
+  const secretStep = await runFirestoreWithTokenRetry(
+    sa,
+    activeAccessToken,
     'lookup_pin_secret',
     { projectId, saProjectId: sa.project_id, staffId },
-    async () => {
-      const primary = await fsGetDoc(projectId, accessToken, `staffPinSecrets/${staffId}`);
+    async (token) => {
+      const primary = await fsGetDoc(projectId, token, `staffPinSecrets/${staffId}`);
       if (primary) return primary;
       if (staffDocId && staffDocId !== staffId) {
-        const fallback = await fsGetDoc(projectId, accessToken, `staffPinSecrets/${staffDocId}`);
+        const fallback = await fsGetDoc(projectId, token, `staffPinSecrets/${staffDocId}`);
         if (fallback) {
           secretDocId = staffDocId;
           return fallback;
@@ -1695,6 +2017,8 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
       return null;
     }
   );
+  activeAccessToken = secretStep.token;
+  const secretDoc = secretStep.result;
   if (!secretDoc || !secretDoc.fields) {
     console.warn(`[auth/login] Missing staffPinSecrets/${staffId}; administrator must run initial PIN provisioning.`);
     return jsonResponse({ error: 'Invalid Staff ID or PIN.' }, 401);
@@ -1730,16 +2054,19 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
     const nextLockedUntil =
       nextFailed >= MAX_FAILED_PIN_ATTEMPTS ? nowMs + LOCKOUT_DURATION_MS : 0;
 
-    await runLoginStage(
+    const failedUpdateStep = await runFirestoreWithTokenRetry(
+      sa,
+      activeAccessToken,
       'update_failed_attempts',
       { projectId, saProjectId: sa.project_id, staffId },
-      () =>
-        fsPatchDoc(projectId, accessToken, `staffPinSecrets/${secretDocId}`, {
+      (token) =>
+        fsPatchDoc(projectId, token, `staffPinSecrets/${secretDocId}`, {
           failedAttempts: { integerValue: String(nextFailed) },
           lockedUntilMs: { integerValue: String(nextLockedUntil) },
           updatedAt: { timestampValue: new Date(nowMs).toISOString() },
         })
     );
+    activeAccessToken = failedUpdateStep.token;
 
     if (nextLockedUntil > 0) {
       return jsonResponse(
@@ -1762,16 +2089,19 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
   const nowIso = new Date(nowMs).toISOString();
 
   if (fsInt(secretFields, 'failedAttempts', 0) !== 0 || lockedUntilMs !== 0) {
-    await runLoginStage(
+    const resetAttemptsStep = await runFirestoreWithTokenRetry(
+      sa,
+      activeAccessToken,
       'update_failed_attempts',
       { projectId, saProjectId: sa.project_id, staffId },
-      () =>
-        fsPatchDoc(projectId, accessToken, `staffPinSecrets/${secretDocId}`, {
+      (token) =>
+        fsPatchDoc(projectId, token, `staffPinSecrets/${secretDocId}`, {
           failedAttempts: { integerValue: '0' },
           lockedUntilMs: { integerValue: '0' },
           updatedAt: { timestampValue: nowIso },
         })
     );
+    activeAccessToken = resetAttemptsStep.token;
   }
 
   // 4. Sync non-destructive auth link fields (preserve all existing staff profile data)
@@ -1785,11 +2115,13 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
   const role = fsStr(staffFields, 'role') || 'staff';
   const designation = fsStr(staffFields, 'designation') || 'ASSISTANT OFFICER';
 
-  await runLoginStage(
+  const authLinkStep = await runFirestoreWithTokenRetry(
+    sa,
+    activeAccessToken,
     'sync_auth_link',
     { projectId, saProjectId: sa.project_id, staffId },
-    () =>
-      fsPatchDoc(projectId, accessToken, `staffAuthLinks/${uid}`, {
+    (token) =>
+      fsPatchDoc(projectId, token, `staffAuthLinks/${uid}`, {
         uid: { stringValue: uid },
         staffId: { stringValue: staffId },
         role: { stringValue: role },
@@ -1798,21 +2130,25 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
         updatedAt: { timestampValue: nowIso },
       })
   );
+  activeAccessToken = authLinkStep.token;
 
   if (
     fsStr(staffFields, 'authUid') !== uid ||
     fsBool(staffFields, 'mustChangePassword', false) !== mustChangePin
   ) {
-    await runLoginStage(
+    const profileSyncStep = await runFirestoreWithTokenRetry(
+      sa,
+      activeAccessToken,
       'sync_staff_profile',
       { projectId, saProjectId: sa.project_id, staffId },
-      () =>
-        fsPatchDoc(projectId, accessToken, `staff/${staffDocId || staffId}`, {
+      (token) =>
+        fsPatchDoc(projectId, token, `staff/${staffDocId || staffId}`, {
           authUid: { stringValue: uid },
           mustChangePassword: { booleanValue: mustChangePin },
           updatedAt: { timestampValue: nowIso },
         })
     );
+    activeAccessToken = profileSyncStep.token;
   }
 
   // 5. Mint Firebase Authentication custom token
@@ -4759,15 +5095,51 @@ export default {
           return jsonResponse({ error: err.message }, err.status);
         }
         if (err instanceof LoginStageError) {
-          return jsonResponse({ error: err.publicMessage, stage: err.stage }, err.status);
+          return jsonResponse(
+            {
+              error: err.publicMessage,
+              stage: err.stage,
+              ...(err.firestoreHttpStatus !== undefined
+                ? { firestoreHttpStatus: err.firestoreHttpStatus }
+                : {}),
+              ...(err.firestoreCode ? { firestoreCode: err.firestoreCode } : {}),
+              ...(err.firestoreOperation
+                ? { firestoreOperation: err.firestoreOperation }
+                : {}),
+            },
+            err.status
+          );
+        }
+        if (err instanceof FirestoreRestError) {
+          console.error('[worker] Firestore API error:', {
+            method: request.method,
+            path: url.pathname,
+            operation: err.operation,
+            target: err.target,
+            httpStatus: err.httpStatus,
+            googleCode: err.googleCode ?? null,
+            googleStatus: err.googleStatus ?? null,
+            safeMessage: err.safeMessage,
+          });
+          return jsonResponse(
+            {
+              error: `Firestore ${err.operation} error (${err.httpStatus}${err.googleStatus ? ` ${err.googleStatus}` : ''}): ${err.safeMessage}`,
+              firestoreHttpStatus: err.httpStatus,
+              ...(err.googleStatus ? { firestoreCode: err.googleStatus } : {}),
+            },
+            500
+          );
         }
         const errName = err instanceof Error ? err.name : typeof err;
-        const errMessage = err instanceof Error ? err.message : String(err);
+        const errMessage = sanitizeErrorText(
+          err instanceof Error ? err.message : String(err),
+          400
+        );
         console.error('[worker] Unhandled API error:', {
           method: request.method,
           path: url.pathname,
           errorName: errName,
-          errorMessage: errMessage.slice(0, 400),
+          errorMessage: errMessage,
         });
         const message =
           err instanceof Error && err.message.includes('FIREBASE_SERVICE_ACCOUNT_KEY')
