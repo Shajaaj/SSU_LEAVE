@@ -41,6 +41,24 @@ export const LeaveStatusLabel: React.FC<{ status: LeaveStatus }> = ({ status }) 
   }
 };
 
+export const ManagerAddedLabel: React.FC<{
+  addedByName?: string;
+  addedByStaffId?: string;
+}> = ({ addedByName, addedByStaffId }) => {
+  const titleText =
+    addedByName || addedByStaffId
+      ? `Added directly by Manager: ${addedByName || addedByStaffId}${addedByStaffId && addedByName ? ` (${addedByStaffId})` : ''}`
+      : 'Added directly by Manager';
+  return (
+    <span
+      title={titleText}
+      className="inline-flex items-center px-1.5 py-0.5 rounded-[3px] text-[10px] font-semibold bg-teal-50 dark:bg-teal-950/60 text-teal-800 dark:text-teal-300 border border-teal-200 dark:border-teal-800/70 whitespace-nowrap"
+    >
+      Manager Added
+    </span>
+  );
+};
+
 export const StaffStatusLabel: React.FC<{ isActive: boolean }> = ({ isActive }) => {
   if (isActive) {
     return (

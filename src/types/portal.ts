@@ -71,6 +71,11 @@ export interface LeaveRequest {
   reviewedByStaffId?: string;
   reviewedByName?: string;
   reviewComment?: string;
+  addedByManager?: boolean;
+  addedByStaffId?: string;
+  addedByName?: string;
+  addedAt?: unknown;
+  editedAt?: unknown;
   lastAuditLogId?: string;
   createdAt?: unknown;
   updatedAt?: unknown;
@@ -103,8 +108,10 @@ export interface DailyCapacityDetail {
 export type AuditAction =
   | 'LEAVE_SUBMITTED'
   | 'LEAVE_APPROVED'
+  | 'MANAGER_LEAVE_ADDED'
   | 'LEAVE_REJECTED'
   | 'LEAVE_CANCELLED'
+  | 'LEAVE_EDITED'
   | 'LEAVE_MODIFIED'
   | 'LEAVE_DATA_CLEARED'
   | 'RESTRICTION_SAVED'

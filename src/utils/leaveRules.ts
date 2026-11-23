@@ -238,6 +238,11 @@ export function validateLeaveSubmission(params: {
   const calendarYear = Number(startDate.slice(0, 4));
   const limit = staff.annualPeriodLimit || settings.maxAnnualLeavePeriods || 3;
 
+  const excludedRequest = excludeRequestId
+    ? userRequests.find((r) => r.requestId === excludeRequestId)
+    : undefined;
+  const alreadyReservedDates = new Set(excludedRequest?.dates || []);
+
   const filteredRequests = excludeRequestId
     ? userRequests.filter((r) => r.requestId !== excludeRequestId)
     : userRequests;
@@ -286,7 +291,11 @@ export function validateLeaveSubmission(params: {
       pendingOverlapDates.push({ date: dateKey, pendingCount: breakdown.pendingCount });
     }
 
-    if (staff.countsTowardDailyCap && breakdown.isFull) {
+    if (
+      staff.countsTowardDailyCap &&
+      breakdown.isFull &&
+      !alreadyReservedDates.has(dateKey)
+    ) {
       unavailableDates.push({
         date: dateKey,
         occupiedCount: breakdown.occupiedCount,
@@ -357,7 +366,7 @@ export function checkApprovalCapacityFeasibility(
       : pendingReservesCapacity && occupied > 0;
 
     const projected = alreadyReserved ? occupied : occupied + 1;
-    if (projected > maxCapacity) {
+    if (!alreadyReserved && projected > maxCapacity) {
       fullDates.push({ date: dateKey, approvedCount: occupied, maxCapacity });
     }
   }

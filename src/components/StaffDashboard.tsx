@@ -33,7 +33,7 @@ import {
   buildPendingDemandMap,
   getDailyCapacityBreakdown,
 } from '../utils/leaveRules';
-import { LeaveColorLegend } from './StatusLabel';
+import { LeaveColorLegend, ManagerAddedLabel } from './StatusLabel';
 
 interface StaffDashboardProps {
   profile: StaffProfile;
@@ -84,6 +84,9 @@ interface TimelineSpan {
   spanDays: number;
   lane: number; // 1-based CSS grid row within staff row
   isMine: boolean;
+  addedByManager?: boolean;
+  addedByStaffId?: string;
+  addedByName?: string;
 }
 
 interface StaffTimelineRow {
@@ -245,6 +248,9 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
         spanDays: endDayNum - startDayNum + 1,
         lane: 1,
         isMine: req.staffId === profile.staffId,
+        addedByManager: Boolean(req.addedByManager),
+        addedByStaffId: req.addedByStaffId,
+        addedByName: req.addedByName,
       });
     }
 
@@ -315,6 +321,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
           spanDays: endDay - startDay + 1,
           lane: 1,
           isMine: g.staffId === profile.staffId,
+          addedByManager: false,
         });
       }
     }
@@ -717,7 +724,7 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
                             key={span.key}
                             type="button"
                             onClick={() => setSelectedSpan(span)}
-                            title={`${span.staffName} (${span.staffId} · ${span.designation}) · ${span.leaveType} · ${formatDisplayDate(span.startDate)} – ${formatDisplayDate(span.endDate)} (${barStyle.statusText})`}
+                            title={`${span.staffName} (${span.staffId} · ${span.designation}) · ${span.leaveType} · ${formatDisplayDate(span.startDate)} – ${formatDisplayDate(span.endDate)} (${barStyle.statusText})${span.addedByManager ? ' · Manager Added' : ''}`}
                             style={{
                               gridColumnStart: span.startCol,
                               gridColumnEnd: span.endCol + 1,
@@ -849,18 +856,39 @@ export const StaffDashboard: React.FC<StaffDashboardProps> = ({
                 </div>
                 <div>
                   <p className="text-slate-500 dark:text-slate-400">Status</p>
-                  <p
-                    className={`font-semibold mt-0.5 ${
-                      selectedSpan.status === 'approved'
-                        ? 'text-emerald-700 dark:text-emerald-400'
-                        : 'text-amber-700 dark:text-amber-400'
-                    }`}
-                  >
-                    {selectedSpan.status === 'approved' ? 'Approved' : 'Pending Approval'}
-                    {selectedSpan.hasModPending ? ' (Modification Pending)' : ''}
-                  </p>
+                  <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                    <p
+                      className={`font-semibold ${
+                        selectedSpan.status === 'approved'
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : 'text-amber-700 dark:text-amber-400'
+                      }`}
+                    >
+                      {selectedSpan.status === 'approved' ? 'Approved' : 'Pending Approval'}
+                      {selectedSpan.hasModPending ? ' (Modification Pending)' : ''}
+                    </p>
+                    {selectedSpan.addedByManager && (
+                      <ManagerAddedLabel
+                        addedByName={selectedSpan.addedByName}
+                        addedByStaffId={selectedSpan.addedByStaffId}
+                      />
+                    )}
+                  </div>
                 </div>
               </div>
+
+              {selectedSpan.addedByManager &&
+                (selectedSpan.addedByName || selectedSpan.addedByStaffId) && (
+                  <div>
+                    <p className="text-slate-500 dark:text-slate-400">Added By Manager</p>
+                    <p className="font-medium text-teal-700 dark:text-teal-400 mt-0.5">
+                      {selectedSpan.addedByName || selectedSpan.addedByStaffId}
+                      {selectedSpan.addedByStaffId && selectedSpan.addedByName
+                        ? ` (${selectedSpan.addedByStaffId})`
+                        : ''}
+                    </p>
+                  </div>
+                )}
 
               <div>
                 <p className="text-slate-500 dark:text-slate-400">Leave Period</p>

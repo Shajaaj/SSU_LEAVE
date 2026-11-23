@@ -2381,6 +2381,316 @@ async function handleCancelPendingLeave(request: Request, env: WorkerEnv): Promi
   return jsonResponse({ ok: true, requestId });
 }
 
+async function handleEditPendingLeave(request: Request, env: WorkerEnv): Promise<Response> {
+  const caller = await authenticateActiveCaller(request, env);
+  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
+
+  let body: {
+    requestId?: unknown;
+    startDate?: unknown;
+    endDate?: unknown;
+  };
+  try {
+    body = (await request.json()) as {
+      requestId?: unknown;
+      startDate?: unknown;
+      endDate?: unknown;
+    };
+  } catch {
+    throw new HttpApiError(400, 'Invalid edit leave payload.');
+  }
+
+  const requestId = typeof body.requestId === 'string' ? body.requestId.trim() : '';
+  const startDate = typeof body.startDate === 'string' ? body.startDate.trim() : '';
+  const endDate = typeof body.endDate === 'string' ? body.endDate.trim() : '';
+
+  if (!requestId) {
+    throw new HttpApiError(400, 'Missing requestId.');
+  }
+
+  const expanded = expandMaldivesDateRange(startDate, endDate, 30);
+  if (expanded.error) {
+    throw new HttpApiError(400, expanded.error);
+  }
+  const newDates = expanded.dates;
+  const newCalendarYear = Number(startDate.slice(0, 4));
+  const logId = makeServerId('log');
+
+  // Verify active leave restrictions against all selected dates before touching slots
+  const restrictionDocs = await fsListCollection(
+    caller.projectId,
+    caller.accessToken,
+    'leaveRestrictions'
+  );
+  const parsedRestrictions = restrictionDocs.map(parseLeaveRestrictionDoc);
+  const blockedCheck = findBlockedDatesWorker(
+    newDates,
+    parsedRestrictions,
+    caller.staffId,
+    caller.designation,
+    caller.uid,
+    caller.staffName
+  );
+  if (blockedCheck.matched.length > 0) {
+    const primary = blockedCheck.matched[0];
+    throw new HttpApiError(
+      409,
+      `You are not permitted to apply for leave during the selected dates (${formatLongDateWorker(primary.startDate)} to ${formatLongDateWorker(primary.endDate)}). Reason: ${primary.reason}. Please select alternative dates.`
+    );
+  }
+
+  const txResult = await runFirestoreTransaction(
+    caller.projectId,
+    caller.accessToken,
+    async (tx) => {
+      const [baseDocsMap, userReqDocs] = await Promise.all([
+        fsBatchGetDocs(
+          caller.projectId,
+          caller.accessToken,
+          [`leaveRequests/${requestId}`, 'appSettings/portalConfig', `staff/${caller.staffId}`],
+          tx
+        ),
+        fsRunQuery(
+          caller.projectId,
+          caller.accessToken,
+          {
+            from: [{ collectionId: 'leaveRequests' }],
+            where: {
+              fieldFilter: {
+                field: { fieldPath: 'staffId' },
+                op: 'EQUAL',
+                value: { stringValue: caller.staffId },
+              },
+            },
+          },
+          tx
+        ),
+      ]);
+
+      const reqDoc = baseDocsMap[`leaveRequests/${requestId}`];
+      if (!reqDoc?.fields) {
+        throw new HttpApiError(404, 'Leave application not found.');
+      }
+
+      const reqData = parseLeaveRequestDoc(reqDoc);
+      if (reqData.staffId !== caller.staffId) {
+        throw new HttpApiError(403, 'You can only edit your own pending leave applications.');
+      }
+
+      if (reqData.status !== 'pending') {
+        throw new HttpApiError(
+          409,
+          'This leave application has already been reviewed and can no longer be edited.'
+        );
+      }
+
+      if (startDate === reqData.startDate && endDate === reqData.endDate) {
+        throw new HttpApiError(400, 'Please select different start or end dates to update.');
+      }
+
+      const settingsDoc = baseDocsMap['appSettings/portalConfig'];
+      const staffDoc = baseDocsMap[`staff/${caller.staffId}`];
+      const maxCap = Math.min(
+        10,
+        Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
+      );
+      const settingsAnnual = Math.min(
+        10,
+        Math.max(1, fsInt(settingsDoc?.fields, 'maxAnnualLeavePeriods', 3))
+      );
+      const annualLimit = Math.min(
+        10,
+        Math.max(
+          1,
+          fsInt(staffDoc?.fields, 'annualPeriodLimit', settingsAnnual || caller.annualPeriodLimit)
+        )
+      );
+
+      // Exclude current request when verifying annual leave periods and overlapping leave
+      const userReqs = userReqDocs
+        .map(parseLeaveRequestDoc)
+        .filter((r) => r.requestId !== reqData.requestId);
+
+      const yearAllocated = userReqs.filter(
+        (r) =>
+          r.calendarYear === newCalendarYear &&
+          (r.status === 'approved' || r.status === 'pending')
+      );
+      if (yearAllocated.length >= annualLimit) {
+        throw new HttpApiError(
+          409,
+          `Annual limit reached for ${newCalendarYear}: ${yearAllocated.length}/${annualLimit} other leave periods used or pending.`
+        );
+      }
+
+      const otherBookedDates = new Set<string>();
+      for (const r of userReqs) {
+        if (r.status === 'approved' || r.status === 'pending') {
+          for (const d of r.dates) otherBookedDates.add(d);
+        }
+      }
+      const overlapping = newDates.filter((d) => otherBookedDates.has(d));
+      if (overlapping.length > 0) {
+        throw new HttpApiError(
+          409,
+          `Requested dates overlap another pending or approved leave on: ${overlapping.join(', ')}.`
+        );
+      }
+
+      const oldDateSet = new Set(reqData.dates.filter(isValidDateKey));
+      const newDateSet = new Set(newDates.filter(isValidDateKey));
+      const allDateKeys = Array.from(new Set([...oldDateSet, ...newDateSet]))
+        .filter(isValidDateKey)
+        .sort();
+
+      const capAndDetailMap = await fsBatchGetDocs(
+        caller.projectId,
+        caller.accessToken,
+        [
+          ...allDateKeys.map((d) => `dailyCapacity/${d}`),
+          ...allDateKeys.map((d) => `dailyCapacityDetails/${d}`),
+        ],
+        tx
+      );
+
+      const nowIso = new Date().toISOString();
+      const writes: FirestoreWrite[] = [];
+      const fullDates: string[] = [];
+
+      for (const dateKey of allDateKeys) {
+        const capDoc = capAndDetailMap[`dailyCapacity/${dateKey}`];
+        const detailDoc = capAndDetailMap[`dailyCapacityDetails/${dateKey}`];
+        const capLimit = Math.min(
+          10,
+          Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
+        );
+
+        const priorAllocs = fsAllocations(detailDoc?.fields);
+        let nextAllocs = priorAllocs.filter((a) => a.requestId !== reqData.requestId);
+        if (newDateSet.has(dateKey)) {
+          nextAllocs = [
+            ...nextAllocs,
+            {
+              staffId: reqData.staffId,
+              staffName: reqData.staffName,
+              designation: reqData.designation,
+              requestId: reqData.requestId,
+              leaveType: reqData.leaveType,
+              status: 'pending',
+            },
+          ];
+        }
+
+        const summary = summarizeAllocationsForDate(nextAllocs);
+        // Staff can always keep dates they already reserved; only newly added dates must pass cap check.
+        if (
+          reqData.countsTowardDailyCap &&
+          newDateSet.has(dateKey) &&
+          !oldDateSet.has(dateKey) &&
+          summary.occupiedCount > capLimit
+        ) {
+          const priorSummary = summarizeAllocationsForDate(priorAllocs);
+          fullDates.push(`${dateKey} (${priorSummary.occupiedCount}/${capLimit})`);
+          continue;
+        }
+
+        writes.push({
+          update: {
+            name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
+            fields: {
+              date: { stringValue: dateKey },
+              approvedCount: { integerValue: String(summary.occupiedCount) },
+              approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
+              pendingCount: { integerValue: String(summary.pendingCount) },
+              maxCapacity: { integerValue: String(capLimit) },
+              updatedAt: { timestampValue: nowIso },
+            },
+          },
+        });
+        writes.push({
+          update: {
+            name: firestoreDocResourceName(caller.projectId, `dailyCapacityDetails/${dateKey}`),
+            fields: {
+              date: { stringValue: dateKey },
+              allocations: allocationsToFirestoreValue(nextAllocs),
+              updatedAt: { timestampValue: nowIso },
+            },
+          },
+        });
+      }
+
+      if (fullDates.length > 0) {
+        throw new HttpApiError(
+          409,
+          `Daily limit (${maxCap} combined Assistant Officers & Attendants) is full on: ${fullDates.join(', ')}.`
+        );
+      }
+
+      const updatedReqFields: Record<string, FirestoreValue> = {
+        ...(reqDoc.fields || {}),
+        startDate: { stringValue: startDate },
+        endDate: { stringValue: endDate },
+        dates: { arrayValue: { values: newDates.map((d) => ({ stringValue: d })) } },
+        daysCount: { integerValue: String(newDates.length) },
+        calendarYear: { integerValue: String(newCalendarYear) },
+        status: { stringValue: 'pending' },
+        modificationRequestType: { stringValue: 'none' },
+        editedAt: { timestampValue: nowIso },
+        lastAuditLogId: { stringValue: logId },
+        updatedAt: { timestampValue: nowIso },
+      };
+
+      writes.push({
+        update: {
+          name: firestoreDocResourceName(caller.projectId, `leaveRequests/${reqData.requestId}`),
+          fields: updatedReqFields,
+        },
+        currentDocument: { exists: true },
+      });
+
+      writes.push({
+        update: {
+          name: firestoreDocResourceName(caller.projectId, `auditLogs/${logId}`),
+          fields: {
+            logId: { stringValue: logId },
+            action: { stringValue: 'LEAVE_EDITED' },
+            targetType: { stringValue: 'leaveRequest' },
+            targetId: { stringValue: reqData.requestId },
+            actorStaffId: { stringValue: caller.staffId },
+            actorName: { stringValue: caller.staffName },
+            actorRole: { stringValue: caller.role },
+            summary: {
+              stringValue: `${caller.staffName} (${caller.staffId}) edited pending ${reqData.leaveType} dates from ${reqData.startDate} – ${reqData.endDate} to ${startDate} – ${endDate} (${newDates.length} day${newDates.length > 1 ? 's' : ''}); daily slots updated.`,
+            },
+            previousStatus: { stringValue: 'pending' },
+            newStatus: { stringValue: 'pending' },
+            affectedDates: {
+              arrayValue: {
+                values: allDateKeys.slice(0, 31).map((d) => ({ stringValue: d })),
+              },
+            },
+            createdAt: { timestampValue: nowIso },
+          },
+        },
+        currentDocument: { exists: false },
+      });
+
+      return {
+        writes,
+        result: {
+          ok: true,
+          requestId: reqData.requestId,
+          startDate,
+          endDate,
+          daysCount: newDates.length,
+        },
+      };
+    }
+  );
+
+  return jsonResponse(txResult);
+}
+
 async function handleApproveLeave(request: Request, env: WorkerEnv): Promise<Response> {
   const caller = await authenticateActiveCaller(request, env);
   if (caller.role !== 'executive' && caller.role !== 'manager') {
@@ -2464,11 +2774,9 @@ async function handleApproveLeave(request: Request, env: WorkerEnv): Promise<Res
       });
 
       const summary = summarizeAllocationsForDate(nextAllocs);
-      if (reqData.countsTowardDailyCap) {
-        if ((!wasAlreadyReserved && summary.occupiedCount > capLimit) || summary.approvedOnlyCount > capLimit) {
-          fullDates.push(`${dateKey} (${summary.occupiedCount}/${capLimit})`);
-          continue;
-        }
+      if (reqData.countsTowardDailyCap && !wasAlreadyReserved && summary.occupiedCount > capLimit) {
+        fullDates.push(`${dateKey} (${summary.occupiedCount}/${capLimit})`);
+        continue;
       }
 
       writes.push({
@@ -3226,6 +3534,262 @@ async function handleRemoveApprovedLeave(request: Request, env: WorkerEnv): Prom
   return jsonResponse({ ok: true, requestId });
 }
 
+async function handleManagerAddLeave(request: Request, env: WorkerEnv): Promise<Response> {
+  const caller = await authenticateActiveCaller(request, env);
+  if (caller.role !== 'manager') {
+    throw new HttpApiError(403, 'Only Managers can add leave directly.');
+  }
+  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
+
+  let body: {
+    staffId?: unknown;
+    startDate?: unknown;
+    endDate?: unknown;
+    reason?: unknown;
+    confirmOverlap?: unknown;
+  };
+  try {
+    body = (await request.json()) as {
+      staffId?: unknown;
+      startDate?: unknown;
+      endDate?: unknown;
+      reason?: unknown;
+      confirmOverlap?: unknown;
+    };
+  } catch {
+    throw new HttpApiError(400, 'Invalid request payload.');
+  }
+
+  const rawStaffId = typeof body.staffId === 'string' ? body.staffId.trim() : '';
+  const startDate = typeof body.startDate === 'string' ? body.startDate.trim() : '';
+  const endDate = typeof body.endDate === 'string' ? body.endDate.trim() : '';
+  const rawReason = typeof body.reason === 'string' ? body.reason.trim() : '';
+  const confirmOverlap = body.confirmOverlap === true;
+
+  if (!isValidStaffIdFormat(rawStaffId)) {
+    throw new HttpApiError(400, 'Please select a valid Staff Member.');
+  }
+  if (rawReason.length > 0 && rawReason.length < 3) {
+    throw new HttpApiError(400, 'Reason / Remarks must be at least 3 characters if provided.');
+  }
+  if (rawReason.length > 500) {
+    throw new HttpApiError(400, 'Reason / Remarks cannot exceed 500 characters.');
+  }
+  const reason = rawReason || 'Added directly by Manager.';
+
+  const expanded = expandMaldivesDateRange(startDate, endDate, 30);
+  if (expanded.error) {
+    throw new HttpApiError(400, expanded.error);
+  }
+  const dates = expanded.dates;
+  const calendarYear = Number(startDate.slice(0, 4));
+
+  const targetMatch = await findAuthorizedStaffDoc(
+    caller.projectId,
+    caller.accessToken,
+    rawStaffId
+  );
+  if (!targetMatch?.doc.fields) {
+    throw new HttpApiError(404, `Staff account ${rawStaffId} was not found.`);
+  }
+  const targetFields = targetMatch.doc.fields;
+  const targetStaffId = targetMatch.staffId;
+  if (!fsBool(targetFields, 'isActive', true)) {
+    throw new HttpApiError(
+      400,
+      `Staff account ${targetStaffId} is inactive. Reactivate the account before assigning leave.`
+    );
+  }
+
+  const targetName = fsStr(targetFields, 'fullName') || targetStaffId;
+  const targetDesignation = fsStr(targetFields, 'designation') || 'ASSISTANT OFFICER';
+  const targetUid = fsStr(targetFields, 'authUid') || deterministicStaffUid(targetStaffId);
+  const targetCountsTowardCap =
+    typeof targetFields.countsTowardDailyCap === 'object' &&
+    'booleanValue' in targetFields.countsTowardDailyCap
+      ? fsBool(targetFields, 'countsTowardDailyCap')
+      : doesDesignationCountTowardCap(targetDesignation);
+
+  const requestId = makeServerId('req');
+  const logId = makeServerId('log');
+
+  const txResult = await runFirestoreTransaction(
+    caller.projectId,
+    caller.accessToken,
+    async (tx) => {
+      const capPaths = dates.map((d) => `dailyCapacity/${d}`);
+      const detailPaths = dates.map((d) => `dailyCapacityDetails/${d}`);
+      const [docsMap, targetReqDocs] = await Promise.all([
+        fsBatchGetDocs(
+          caller.projectId,
+          caller.accessToken,
+          ['appSettings/portalConfig', ...capPaths, ...detailPaths],
+          tx
+        ),
+        fsRunQuery(
+          caller.projectId,
+          caller.accessToken,
+          {
+            from: [{ collectionId: 'leaveRequests' }],
+            where: {
+              fieldFilter: {
+                field: { fieldPath: 'staffId' },
+                op: 'EQUAL',
+                value: { stringValue: targetStaffId },
+              },
+            },
+          },
+          tx
+        ),
+      ]);
+
+      const bookedDates = new Set<string>();
+      for (const doc of targetReqDocs) {
+        const parsed = parseLeaveRequestDoc(doc);
+        if (parsed.status === 'pending' || parsed.status === 'approved') {
+          for (const d of parsed.dates) bookedDates.add(d);
+        }
+      }
+      const overlappingDates = dates.filter((d) => bookedDates.has(d));
+      if (overlappingDates.length > 0 && !confirmOverlap) {
+        throw new HttpApiError(
+          409,
+          `OVERLAP_CONFIRM_REQUIRED: ${targetName} (${targetStaffId}) already has pending or approved leave on: ${overlappingDates.join(', ')}. Please confirm to add overlapping leave.`
+        );
+      }
+
+      const settingsDoc = docsMap['appSettings/portalConfig'];
+      const maxCap = Math.min(
+        10,
+        Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
+      );
+
+      const nowIso = new Date().toISOString();
+      const writes: FirestoreWrite[] = [];
+      let peakOccupied = 0;
+
+      // Manager-added leave bypasses 3-period annual limit, 10-slot daily cap, blocked dates, and (with confirmation) overlaps
+      for (const dateKey of dates) {
+        const capDoc = docsMap[`dailyCapacity/${dateKey}`];
+        const detailDoc = docsMap[`dailyCapacityDetails/${dateKey}`];
+        const capLimit = Math.min(
+          10,
+          Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
+        );
+
+        const nextAllocs = fsAllocations(detailDoc?.fields).filter(
+          (a) => a.requestId !== requestId
+        );
+        nextAllocs.push({
+          staffId: targetStaffId,
+          staffName: targetName,
+          designation: targetDesignation,
+          requestId,
+          leaveType: 'Annual Leave',
+          status: 'approved',
+        });
+
+        const summary = summarizeAllocationsForDate(nextAllocs);
+        if (summary.occupiedCount > peakOccupied) {
+          peakOccupied = summary.occupiedCount;
+        }
+
+        writes.push({
+          update: {
+            name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
+            fields: {
+              date: { stringValue: dateKey },
+              approvedCount: { integerValue: String(summary.occupiedCount) },
+              approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
+              pendingCount: { integerValue: String(summary.pendingCount) },
+              maxCapacity: { integerValue: String(capLimit) },
+              updatedAt: { timestampValue: nowIso },
+            },
+          },
+        });
+        writes.push({
+          update: {
+            name: firestoreDocResourceName(caller.projectId, `dailyCapacityDetails/${dateKey}`),
+            fields: {
+              date: { stringValue: dateKey },
+              allocations: allocationsToFirestoreValue(nextAllocs),
+              updatedAt: { timestampValue: nowIso },
+            },
+          },
+        });
+      }
+
+      writes.push({
+        update: {
+          name: firestoreDocResourceName(caller.projectId, `leaveRequests/${requestId}`),
+          fields: {
+            requestId: { stringValue: requestId },
+            ...(targetUid ? { uid: { stringValue: targetUid } } : {}),
+            staffId: { stringValue: targetStaffId },
+            staffName: { stringValue: targetName },
+            designation: { stringValue: targetDesignation },
+            countsTowardDailyCap: { booleanValue: targetCountsTowardCap },
+            leaveType: { stringValue: 'Annual Leave' },
+            startDate: { stringValue: startDate },
+            endDate: { stringValue: endDate },
+            dates: { arrayValue: { values: dates.map((d) => ({ stringValue: d })) } },
+            daysCount: { integerValue: String(dates.length) },
+            calendarYear: { integerValue: String(calendarYear) },
+            reason: { stringValue: reason },
+            status: { stringValue: 'approved' },
+            modificationRequestType: { stringValue: 'none' },
+            addedByManager: { booleanValue: true },
+            addedByStaffId: { stringValue: caller.staffId },
+            addedByName: { stringValue: caller.staffName },
+            addedAt: { timestampValue: nowIso },
+            reviewedByStaffId: { stringValue: caller.staffId },
+            reviewedByName: { stringValue: caller.staffName },
+            reviewComment: { stringValue: 'Added directly by Manager.' },
+            lastAuditLogId: { stringValue: logId },
+            createdAt: { timestampValue: nowIso },
+            updatedAt: { timestampValue: nowIso },
+          },
+        },
+        currentDocument: { exists: false },
+      });
+
+      const overCapNote =
+        targetCountsTowardCap && peakOccupied > maxCap
+          ? ` (peak daily occupancy ${peakOccupied}/${maxCap})`
+          : '';
+      const overlapNote = overlappingDates.length > 0 ? ' (overlap confirmed)' : '';
+
+      writes.push({
+        update: {
+          name: firestoreDocResourceName(caller.projectId, `auditLogs/${logId}`),
+          fields: {
+            logId: { stringValue: logId },
+            action: { stringValue: 'MANAGER_LEAVE_ADDED' },
+            targetType: { stringValue: 'leaveRequest' },
+            targetId: { stringValue: requestId },
+            actorStaffId: { stringValue: caller.staffId },
+            actorName: { stringValue: caller.staffName },
+            actorRole: { stringValue: 'manager' },
+            summary: {
+              stringValue: `Manager added approved leave for ${targetName} (${targetStaffId}, ${targetDesignation}) for ${startDate} – ${endDate} (${dates.length}d)${overCapNote}${overlapNote}.`,
+            },
+            newStatus: { stringValue: 'approved' },
+            affectedDates: {
+              arrayValue: { values: dates.slice(0, 31).map((d) => ({ stringValue: d })) },
+            },
+            createdAt: { timestampValue: nowIso },
+          },
+        },
+        currentDocument: { exists: false },
+      });
+
+      return { writes, result: { ok: true, requestId, peakOccupied } };
+    }
+  );
+
+  return jsonResponse(txResult);
+}
+
 async function handleRemoveStaff(request: Request, env: WorkerEnv): Promise<Response> {
   const caller = await authenticateActiveCaller(request, env);
   if (caller.role !== 'manager') {
@@ -3837,6 +4401,9 @@ export default {
         if (request.method === 'POST' && url.pathname === '/api/leave/cancel-pending') {
           return await handleCancelPendingLeave(request, env);
         }
+        if (request.method === 'POST' && url.pathname === '/api/leave/edit-pending') {
+          return await handleEditPendingLeave(request, env);
+        }
         if (request.method === 'POST' && url.pathname === '/api/leave/approve') {
           return await handleApproveLeave(request, env);
         }
@@ -3848,6 +4415,9 @@ export default {
         }
         if (request.method === 'POST' && url.pathname === '/api/leave/remove-approved') {
           return await handleRemoveApprovedLeave(request, env);
+        }
+        if (request.method === 'POST' && url.pathname === '/api/leave/manager-add') {
+          return await handleManagerAddLeave(request, env);
         }
         return jsonResponse({ error: 'Not found.' }, 404);
       } catch (err) {

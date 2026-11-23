@@ -34,6 +34,7 @@ import {
   AvailabilityLabel,
   LeaveColorLegend,
   LeaveStatusLabel,
+  ManagerAddedLabel,
 } from './StatusLabel';
 
 interface LeaveCalendarProps {
@@ -538,7 +539,7 @@ export const LeaveCalendar: React.FC<LeaveCalendarProps> = ({
             {selectedDayMyRestrictions.length > 0
               ? `Restricted Date (${formatDisplayDate(selectedDay)})`
               : currentProfile.countsTowardDailyCap && selectedBreakdown.isFull
-                ? `Day Capacity Full (${selectedBreakdown.maxCapacity}/${selectedBreakdown.maxCapacity})`
+                ? `Day Capacity Full (${selectedBreakdown.occupiedCount}/${selectedBreakdown.maxCapacity})`
                 : `Apply for ${formatDisplayDate(selectedDay)}`}
           </button>
         </div>
@@ -604,7 +605,13 @@ export const LeaveCalendar: React.FC<LeaveCalendarProps> = ({
                           </p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {req.addedByManager && (
+                          <ManagerAddedLabel
+                            addedByName={req.addedByName}
+                            addedByStaffId={req.addedByStaffId}
+                          />
+                        )}
                         <span
                           className={`px-2 py-0.5 rounded-[2px] text-[10px] font-semibold ${barStyle.badgeClass}`}
                         >
@@ -647,7 +654,13 @@ export const LeaveCalendar: React.FC<LeaveCalendarProps> = ({
                           </p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {req.addedByManager && (
+                          <ManagerAddedLabel
+                            addedByName={req.addedByName}
+                            addedByStaffId={req.addedByStaffId}
+                          />
+                        )}
                         <span
                           className={`px-2 py-0.5 rounded-[2px] text-[10px] font-semibold ${barStyle.badgeClass}`}
                         >

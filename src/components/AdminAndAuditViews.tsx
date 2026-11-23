@@ -1482,8 +1482,10 @@ export const AuditLogsView: React.FC<{ logs: AuditLog[] }> = ({ logs }) => {
           <option value="all">All Actions</option>
           <option value="LEAVE_SUBMITTED">LEAVE_SUBMITTED</option>
           <option value="LEAVE_APPROVED">LEAVE_APPROVED</option>
+          <option value="MANAGER_LEAVE_ADDED">MANAGER_LEAVE_ADDED</option>
           <option value="LEAVE_REJECTED">LEAVE_REJECTED</option>
           <option value="LEAVE_CANCELLED">LEAVE_CANCELLED</option>
+          <option value="LEAVE_EDITED">LEAVE_EDITED</option>
           <option value="LEAVE_MODIFIED">LEAVE_MODIFIED</option>
           <option value="LEAVE_DATA_CLEARED">LEAVE_DATA_CLEARED</option>
           <option value="RESTRICTION_SAVED">RESTRICTION_SAVED</option>

@@ -848,6 +848,72 @@ export async function cancelPendingLeaveRequest(
   );
 }
 
+export async function editPendingLeaveDates(
+  staff: StaffProfile,
+  req: LeaveRequest,
+  payload: {
+    startDate: string;
+    endDate: string;
+  }
+): Promise<{ startDate: string; endDate: string; daysCount: number }> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
+  }
+  if (!staff.isActive) {
+    throw new Error('Your staff account is inactive. Contact a Manager.');
+  }
+  if (req.staffId !== staff.staffId) {
+    throw new Error('You can only edit your own pending leave applications.');
+  }
+  if (req.status !== 'pending') {
+    throw new Error('This leave application has already been reviewed and can no longer be edited.');
+  }
+
+  const expanded = expandDateRange(payload.startDate, payload.endDate, 30);
+  if (expanded.error) {
+    throw new Error(expanded.error);
+  }
+
+  const activeRestrictions = await loadActiveRestrictionsStrict();
+  const blockedCheck = findRestrictedDatesForStaff(
+    expanded.dates,
+    activeRestrictions,
+    staff
+  );
+  if (blockedCheck.matchedRestrictions.length > 0) {
+    const primary = blockedCheck.matchedRestrictions[0];
+    throw new RestrictedLeaveError(
+      `You are not permitted to apply for leave during the selected dates. Reason: ${primary.reason}. Please select alternative dates.`,
+      blockedCheck.blockedDates,
+      blockedCheck.matchedRestrictions
+    );
+  }
+
+  const idToken = await user.getIdToken(true);
+  const res = await postWorkerJson<{
+    ok: boolean;
+    requestId: string;
+    startDate: string;
+    endDate: string;
+    daysCount: number;
+  }>(
+    '/api/leave/edit-pending',
+    {
+      requestId: req.requestId,
+      startDate: payload.startDate,
+      endDate: payload.endDate,
+    },
+    idToken
+  );
+
+  return {
+    startDate: res.startDate,
+    endDate: res.endDate,
+    daysCount: Number(res.daysCount || expanded.dates.length),
+  };
+}
+
 export async function requestLeaveModification(
   staff: StaffProfile,
   req: LeaveRequest,
@@ -1045,6 +1111,50 @@ export async function removeApprovedLeaveRequest(requestId: string): Promise<voi
     { requestId },
     idToken
   );
+}
+
+export async function managerAddApprovedLeave(payload: {
+  staffId: string;
+  startDate: string;
+  endDate: string;
+  reason: string;
+  confirmOverlap: boolean;
+}): Promise<{ requestId: string; peakOccupied: number }> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Authentication required. Please log in again.');
+  }
+  const trimmedReason = payload.reason.trim();
+  if (trimmedReason.length > 0 && trimmedReason.length < 3) {
+    throw new Error('Reason / Remarks must be at least 3 characters if provided.');
+  }
+  if (trimmedReason.length > 500) {
+    throw new Error('Reason / Remarks cannot exceed 500 characters.');
+  }
+  const expanded = expandDateRange(payload.startDate, payload.endDate, 30);
+  if (expanded.error) {
+    throw new Error(expanded.error);
+  }
+  const idToken = await user.getIdToken(true);
+  const res = await postWorkerJson<{
+    ok: boolean;
+    requestId: string;
+    peakOccupied?: number;
+  }>(
+    '/api/leave/manager-add',
+    {
+      staffId: payload.staffId.trim(),
+      startDate: payload.startDate,
+      endDate: payload.endDate,
+      reason: trimmedReason || 'Added directly by Manager.',
+      confirmOverlap: payload.confirmOverlap,
+    },
+    idToken
+  );
+  return {
+    requestId: res.requestId,
+    peakOccupied: Number(res.peakOccupied || 0),
+  };
 }
 
 export async function updateStaffProfile(

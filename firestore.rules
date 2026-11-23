@@ -109,7 +109,8 @@ service cloud.firestore {
           'leaveType', 'startDate', 'endDate', 'dates', 'daysCount', 'calendarYear',
           'reason', 'status', 'modificationRequestType', 'modificationNote',
           'requestedStartDate', 'requestedEndDate', 'reviewedByStaffId',
-          'reviewedByName', 'reviewComment', 'lastAuditLogId', 'createdAt', 'updatedAt'
+          'reviewedByName', 'reviewComment', 'addedByManager', 'addedByStaffId',
+          'addedByName', 'addedAt', 'editedAt', 'lastAuditLogId', 'createdAt', 'updatedAt'
         ])
         && data.requestId == requestId
         && isValidId(data.requestId)
@@ -134,6 +135,11 @@ service cloud.firestore {
         && (!('reviewedByStaffId' in data) || (data.reviewedByStaffId is string && data.reviewedByStaffId.size() <= 24))
         && (!('reviewedByName' in data) || (data.reviewedByName is string && data.reviewedByName.size() <= 100))
         && (!('reviewComment' in data) || (data.reviewComment is string && data.reviewComment.size() <= 500))
+        && (!('addedByManager' in data) || data.addedByManager is bool)
+        && (!('addedByStaffId' in data) || (data.addedByStaffId is string && data.addedByStaffId.size() <= 24))
+        && (!('addedByName' in data) || (data.addedByName is string && data.addedByName.size() <= 100))
+        && (!('addedAt' in data) || data.addedAt is timestamp)
+        && (!('editedAt' in data) || data.editedAt is timestamp)
         && (!('lastAuditLogId' in data) || isValidId(data.lastAuditLogId))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -151,9 +157,9 @@ service cloud.firestore {
         && data.maxCapacity >= 1
         && data.maxCapacity <= 10
         && data.approvedCount >= 0
-        && data.approvedCount <= data.maxCapacity
-        && (!('approvedOnlyCount' in data) || (data.approvedOnlyCount is int && data.approvedOnlyCount >= 0 && data.approvedOnlyCount <= data.maxCapacity))
-        && (!('pendingCount' in data) || (data.pendingCount is int && data.pendingCount >= 0 && data.pendingCount <= data.maxCapacity))
+        && data.approvedCount <= 60
+        && (!('approvedOnlyCount' in data) || (data.approvedOnlyCount is int && data.approvedOnlyCount >= 0 && data.approvedOnlyCount <= 60))
+        && (!('pendingCount' in data) || (data.pendingCount is int && data.pendingCount >= 0 && data.pendingCount <= 60))
         && data.updatedAt is timestamp;
     }
 
@@ -181,8 +187,8 @@ service cloud.firestore {
         && data.logId == logId
         && isValidId(data.logId)
         && data.action in [
-          'LEAVE_SUBMITTED', 'LEAVE_APPROVED', 'LEAVE_REJECTED',
-          'LEAVE_CANCELLED', 'LEAVE_MODIFIED', 'LEAVE_DATA_CLEARED',
+          'LEAVE_SUBMITTED', 'LEAVE_APPROVED', 'MANAGER_LEAVE_ADDED', 'LEAVE_REJECTED',
+          'LEAVE_CANCELLED', 'LEAVE_EDITED', 'LEAVE_MODIFIED', 'LEAVE_DATA_CLEARED',
           'RESTRICTION_SAVED', 'RESTRICTION_REMOVED', 'MOD_REQUESTED',
           'STAFF_PROVISIONED', 'STAFF_IMPORTED', 'STAFF_UPDATED',
           'STAFF_DEACTIVATED', 'STAFF_REMOVED', 'SETTINGS_UPDATED',
@@ -405,6 +411,21 @@ service cloud.firestore {
               'reviewComment', 'lastAuditLogId', 'updatedAt'
             ])
           )
+          // Action 5: Staff edits dates on own pending leave request
+          || (
+            existing().staffId == callerStaffId()
+            && existing().status == 'pending'
+            && incoming().status == 'pending'
+            && incoming().modificationRequestType == 'none'
+            && !('reviewedByStaffId' in incoming())
+            && !('reviewedByName' in incoming())
+            && !('reviewComment' in incoming())
+            && incoming().editedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'startDate', 'endDate', 'dates', 'daysCount', 'calendarYear',
+              'editedAt', 'lastAuditLogId', 'updatedAt'
+            ])
+          )
         );
 
       allow delete: if isManager() && isValidId(requestId);
@@ -445,10 +466,10 @@ service cloud.firestore {
           isManager()
           || (isExecutiveOrManager() && incoming().action in [
             'LEAVE_SUBMITTED', 'LEAVE_APPROVED', 'LEAVE_REJECTED',
-            'LEAVE_CANCELLED', 'LEAVE_MODIFIED', 'MOD_REQUESTED', 'PASSWORD_UPDATED'
+            'LEAVE_CANCELLED', 'LEAVE_EDITED', 'LEAVE_MODIFIED', 'MOD_REQUESTED', 'PASSWORD_UPDATED'
           ])
           || incoming().action in [
-            'LEAVE_SUBMITTED', 'LEAVE_CANCELLED', 'MOD_REQUESTED', 'PASSWORD_UPDATED'
+            'LEAVE_SUBMITTED', 'LEAVE_EDITED', 'LEAVE_CANCELLED', 'MOD_REQUESTED', 'PASSWORD_UPDATED'
           ]
         );
       allow update, delete: if false;

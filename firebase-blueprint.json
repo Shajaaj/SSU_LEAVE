@@ -250,6 +250,25 @@
           "type": "string",
           "maxLength": 500
         },
+        "addedByManager": {
+          "type": "boolean"
+        },
+        "addedByStaffId": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "addedByName": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "addedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "editedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
         "lastAuditLogId": {
           "type": "string",
           "maxLength": 128
@@ -284,7 +303,7 @@
     },
     "DailyCapacity": {
       "title": "DailyCapacity",
-      "description": "Atomic daily capacity counter (max 10 combined Pending + Approved allocations for Assistant Officers and Attendants).",
+      "description": "Atomic daily capacity counter (standard max 10 combined Pending + Approved allocations for Assistant Officers and Attendants; may exceed 10 when Manager-added leave overrides capacity).",
       "type": "object",
       "properties": {
         "date": {
@@ -351,8 +370,10 @@
           "enum": [
             "LEAVE_SUBMITTED",
             "LEAVE_APPROVED",
+            "MANAGER_LEAVE_ADDED",
             "LEAVE_REJECTED",
             "LEAVE_CANCELLED",
+            "LEAVE_EDITED",
             "LEAVE_MODIFIED",
             "LEAVE_DATA_CLEARED",
             "RESTRICTION_SAVED",
@@ -394,7 +415,7 @@
         "summary": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 300
+          "maxLength": 650
         },
         "previousStatus": {
           "type": "string",

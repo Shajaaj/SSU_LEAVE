@@ -31,9 +31,11 @@ import {
   changeOwnPassword,
   clearAllLeaveRecords,
   deleteLeaveRestriction,
+  editPendingLeaveDates,
   fetchLeaveRestrictionsFromWorker,
   loadActiveRestrictionsStrict,
   logoutSession,
+  managerAddApprovedLeave,
   processLeaveModification,
   rejectLeaveRequest,
   removeApprovedLeaveRequest,
@@ -441,6 +443,19 @@ export default function App() {
     );
   };
 
+  const handleEditPending = async (
+    req: LeaveRequest,
+    payload: { startDate: string; endDate: string }
+  ) => {
+    if (!liveProfile) return;
+    const res = await editPendingLeaveDates(liveProfile, req, payload);
+    addToast(
+      'success',
+      'Leave Dates Updated',
+      `Pending leave updated to ${res.startDate} – ${res.endDate} (${res.daysCount} day${res.daysCount === 1 ? '' : 's'}).`
+    );
+  };
+
   const handleRequestModification = async (params: {
     req: LeaveRequest;
     type: 'edit' | 'cancel';
@@ -500,6 +515,22 @@ export default function App() {
       addToast('error', 'Failed to Remove Leave', msg);
       throw err;
     }
+  };
+
+  const handleManagerAddLeave = async (payload: {
+    staffId: string;
+    startDate: string;
+    endDate: string;
+    reason: string;
+    confirmOverlap: boolean;
+  }) => {
+    if (!liveProfile || liveProfile.role !== 'manager') return;
+    await managerAddApprovedLeave(payload);
+    addToast(
+      'success',
+      'Approved Leave Added',
+      `Approved leave assigned for ${payload.staffId} (${payload.startDate} – ${payload.endDate}).`
+    );
   };
 
   const handleUpdateStaff = async (
@@ -707,8 +738,14 @@ export default function App() {
           profile={liveProfile}
           requests={liveMyRequests}
           restrictions={liveRestrictions}
+          capacityMap={liveCapacityMap}
+          capacityDetailsMap={liveCapacityDetailsMap}
+          pendingDemandMap={pendingDemandMap}
+          settings={liveSettings}
           loading={loadingRequests}
           onOpenNewRequest={() => handleOpenNewRequest()}
+          onRefreshRestrictions={refreshRestrictions}
+          onEditPending={handleEditPending}
           onCancelPending={handleCancelPending}
           onRequestModification={handleRequestModification}
         />
@@ -727,6 +764,9 @@ export default function App() {
             onReject={handleRejectLeave}
             onProcessModification={handleProcessModification}
             onRemoveApproved={handleRemoveApprovedLeave}
+            onManagerAddLeave={
+              liveProfile.role === 'manager' ? handleManagerAddLeave : undefined
+            }
           />
         )}
 

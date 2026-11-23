@@ -1,6 +1,9 @@
 import React, { useMemo, useState } from 'react';
 import { AlertCircle, CalendarClock, Edit3, Plus, XCircle } from 'lucide-react';
 import {
+  AppSettings,
+  DailyCapacity,
+  DailyCapacityDetail,
   LeaveRequest,
   LeaveRestriction,
   LeaveStatus,
@@ -12,15 +15,25 @@ import {
   formatTimestampForDisplay,
 } from '../utils/maldivesDate';
 import { findRestrictedDatesForStaff, formatLongDate } from '../utils/leaveRestrictions';
+import { EditPendingLeaveModal } from './EditPendingLeaveModal';
 import { LeaveRestrictedPopup } from './LeaveRestrictedPopup';
-import { LeaveStatusLabel } from './StatusLabel';
+import { LeaveStatusLabel, ManagerAddedLabel } from './StatusLabel';
 
 interface MyRequestsViewProps {
   profile: StaffProfile;
   requests: LeaveRequest[];
   restrictions?: LeaveRestriction[];
+  capacityMap?: Record<string, DailyCapacity>;
+  capacityDetailsMap?: Record<string, DailyCapacityDetail>;
+  pendingDemandMap?: Record<string, number>;
+  settings?: AppSettings;
   loading: boolean;
   onOpenNewRequest: () => void;
+  onRefreshRestrictions?: () => Promise<LeaveRestriction[]>;
+  onEditPending: (
+    req: LeaveRequest,
+    payload: { startDate: string; endDate: string }
+  ) => Promise<void>;
   onCancelPending: (req: LeaveRequest) => Promise<void>;
   onRequestModification: (params: {
     req: LeaveRequest;
@@ -35,13 +48,30 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
   profile,
   requests,
   restrictions = [],
+  capacityMap = {},
+  capacityDetailsMap = {},
+  pendingDemandMap = {},
+  settings = {
+    maxDailyCombinedCap: 10,
+    maxAnnualLeavePeriods: 3,
+    pendingReservesCapacity: true,
+    timezone: 'Asia/Male',
+    unitName: 'Special Services Unit',
+    airportName: 'Velana International Airport',
+    updatedByStaffId: 'SYSTEM',
+  },
   loading,
   onOpenNewRequest,
+  onRefreshRestrictions,
+  onEditPending,
   onCancelPending,
   onRequestModification,
 }) => {
   const [filterStatus, setFilterStatus] = useState<'all' | LeaveStatus>('all');
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  // Edit Pending Leave Modal State
+  const [editTarget, setEditTarget] = useState<LeaveRequest | null>(null);
 
   // Modification Modal State for Approved Leave
   const [modTarget, setModTarget] = useState<LeaveRequest | null>(null);
@@ -51,6 +81,11 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
   const [modEnd, setModEnd] = useState('');
   const [modError, setModError] = useState<string | null>(null);
   const [dismissedModPopupSig, setDismissedModPopupSig] = useState<string | null>(null);
+
+  const liveEditTarget = useMemo(() => {
+    if (!editTarget) return null;
+    return requests.find((r) => r.requestId === editTarget.requestId) || null;
+  }, [editTarget, requests]);
 
   const filtered = useMemo(() => {
     if (filterStatus === 'all') return requests;
@@ -196,6 +231,20 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
                 <div className="space-y-1 min-w-0">
                   <div className="flex flex-wrap items-center gap-2.5">
                     <LeaveStatusLabel status={req.status} />
+                    {Boolean(req.editedAt) && (
+                      <span
+                        title={`Dates edited: ${formatTimestampForDisplay(req.editedAt)}`}
+                        className="inline-flex items-center px-1.5 py-0.5 rounded-[3px] text-[10px] font-semibold bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800/70 whitespace-nowrap"
+                      >
+                        Edited
+                      </span>
+                    )}
+                    {req.addedByManager && (
+                      <ManagerAddedLabel
+                        addedByName={req.addedByName}
+                        addedByStaffId={req.addedByStaffId}
+                      />
+                    )}
                     <span className="text-xs font-semibold text-slate-900 dark:text-white">
                       {req.leaveType}
                     </span>
@@ -206,6 +255,12 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
                   <p className="text-xs text-slate-600 dark:text-slate-300">
                     {req.reason}
                   </p>
+                  {req.addedByManager && (req.addedByName || req.addedByStaffId) && (
+                    <p className="text-[11px] text-teal-700 dark:text-teal-400">
+                      Added by Manager: {req.addedByName || req.addedByStaffId}
+                      {req.addedByStaffId && req.addedByName ? ` (${req.addedByStaffId})` : ''}
+                    </p>
+                  )}
                   {req.reviewComment && (
                     <p className="text-[11px] text-slate-500 dark:text-slate-400">
                       Reviewer ({req.reviewedByName || 'Management'}): {req.reviewComment}
@@ -222,27 +277,44 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
                   )}
                   <p className="text-[11px] font-mono text-slate-400">
                     Submitted: {formatTimestampForDisplay(req.createdAt)}
+                    {req.editedAt ? ` · Edited: ${formatTimestampForDisplay(req.editedAt)}` : ''}
                   </p>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 shrink-0 w-full sm:w-auto">
-                  {req.status === 'pending' && (
-                    <button
-                      type="button"
-                      disabled={busyId === req.requestId}
-                      onClick={async () => {
-                        setBusyId(req.requestId);
-                        try {
-                          await onCancelPending(req);
-                        } finally {
-                          setBusyId(null);
-                        }
-                      }}
-                      className="flex-1 sm:flex-initial min-h-[44px] sm:min-h-0 px-3 py-1.5 rounded-lg border border-red-200 dark:border-red-900/60 text-xs font-semibold text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 flex items-center justify-center gap-1.5 whitespace-nowrap"
-                    >
-                      <XCircle className="w-3.5 h-3.5" aria-hidden="true" />
-                      <span>Cancel Request</span>
-                    </button>
+                  {req.status === 'pending' && req.staffId === profile.staffId && (
+                    <>
+                      <button
+                        type="button"
+                        disabled={busyId === req.requestId}
+                        onClick={() => {
+                          setEditTarget(req);
+                          if (onRefreshRestrictions) {
+                            void onRefreshRestrictions().catch(() => undefined);
+                          }
+                        }}
+                        className="flex-1 sm:flex-initial min-h-[44px] sm:min-h-0 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-center gap-1.5 whitespace-nowrap"
+                      >
+                        <Edit3 className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>Edit Dates</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busyId === req.requestId}
+                        onClick={async () => {
+                          setBusyId(req.requestId);
+                          try {
+                            await onCancelPending(req);
+                          } finally {
+                            setBusyId(null);
+                          }
+                        }}
+                        className="flex-1 sm:flex-initial min-h-[44px] sm:min-h-0 px-3 py-1.5 rounded-lg border border-red-200 dark:border-red-900/60 text-xs font-semibold text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 flex items-center justify-center gap-1.5 whitespace-nowrap"
+                      >
+                        <XCircle className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>Cancel Request</span>
+                      </button>
+                    </>
                   )}
 
                   {req.status === 'approved' && req.modificationRequestType === 'none' && (
@@ -381,6 +453,22 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
           </div>
         </div>
       )}
+
+      <EditPendingLeaveModal
+        open={Boolean(editTarget)}
+        onClose={() => setEditTarget(null)}
+        staff={profile}
+        targetRequest={editTarget}
+        liveRequest={liveEditTarget}
+        userRequests={requests}
+        capacityMap={capacityMap}
+        capacityDetailsMap={capacityDetailsMap}
+        pendingDemandMap={pendingDemandMap}
+        settings={settings}
+        restrictions={restrictions}
+        onRefreshRestrictions={onRefreshRestrictions}
+        onSave={onEditPending}
+      />
 
       <LeaveRestrictedPopup
         open={showModRestrictedPopup}

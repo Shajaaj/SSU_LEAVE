@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Download,
+  Plus,
   Search,
   Trash2,
   XCircle,
@@ -27,7 +28,12 @@ import {
   getCurrentYearInMaldives,
   getTodayInMaldives,
 } from '../utils/maldivesDate';
-import { LeaveStatusLabel, StaffStatusLabel } from './StatusLabel';
+import { ManagerAddLeaveModal } from './ManagerAddLeaveModal';
+import {
+  LeaveStatusLabel,
+  ManagerAddedLabel,
+  StaffStatusLabel,
+} from './StatusLabel';
 
 /* -------------------------------------------------------------------------- */
 /* 1. Management Approvals & Operational Overview                              */
@@ -48,6 +54,13 @@ interface ManagementQueueViewProps {
     comment: string
   ) => Promise<void>;
   onRemoveApproved?: (requestId: string) => Promise<void>;
+  onManagerAddLeave?: (payload: {
+    staffId: string;
+    startDate: string;
+    endDate: string;
+    reason: string;
+    confirmOverlap: boolean;
+  }) => Promise<void>;
 }
 
 export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
@@ -61,9 +74,11 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
   onReject,
   onProcessModification,
   onRemoveApproved,
+  onManagerAddLeave,
 }) => {
   const today = getTodayInMaldives();
   const maxCap = settings.maxDailyCombinedCap || 10;
+  const isManager = currentProfile.role === 'manager';
   const canRemoveApproved =
     (currentProfile.role === 'executive' || currentProfile.role === 'manager') &&
     Boolean(onRemoveApproved);
@@ -79,6 +94,7 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
   const [removeError, setRemoveError] = useState<string | null>(null);
   const [queueStatusView, setQueueStatusView] = useState<'approved' | 'cancelled'>('approved');
   const [approvedSearch, setApprovedSearch] = useState('');
+  const [addLeaveModalOpen, setAddLeaveModalOpen] = useState(false);
 
   const activeStaffCount = useMemo(
     () => profiles.filter((p) => p.isActive).length,
@@ -198,6 +214,27 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
 
   return (
     <div className="space-y-6">
+      {isManager && onManagerAddLeave && (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base sm:text-lg font-display font-bold text-[#0B1F3A] dark:text-white">
+              Approvals Queue
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Review pending leave requests, manage approved leave, or assign approved leave directly as Manager.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setAddLeaveModalOpen(true)}
+            className="w-full sm:w-auto min-h-[44px] sm:min-h-0 px-3.5 py-2 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-xs font-semibold flex items-center justify-center gap-1.5 whitespace-nowrap shadow-xs"
+          >
+            <Plus className="w-4 h-4" aria-hidden="true" />
+            <span>Add Leave</span>
+          </button>
+        </div>
+      )}
+
       {/* Management KPI Strip */}
       <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
         <div className="bg-white dark:bg-[#0D1B2A] border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-1">
@@ -244,7 +281,9 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
             {todayBreakdown.occupiedCount} / {todayBreakdown.maxCapacity}
           </p>
           <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-            {todayBreakdown.availableSlots} left ({todayBreakdown.approvedOnlyCount} approved · {todayBreakdown.pendingCount} pending)
+            {todayBreakdown.occupiedCount > todayBreakdown.maxCapacity
+              ? `${todayBreakdown.occupiedCount - todayBreakdown.maxCapacity} over cap (${todayBreakdown.approvedOnlyCount} approved · ${todayBreakdown.pendingCount} pending)`
+              : `${todayBreakdown.availableSlots} left (${todayBreakdown.approvedOnlyCount} approved · ${todayBreakdown.pendingCount} pending)`}
           </p>
         </div>
       </section>
@@ -303,6 +342,14 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                         >
                           Pending
                         </span>
+                        {Boolean(req.editedAt) && (
+                          <span
+                            title={`Dates edited: ${formatTimestampForDisplay(req.editedAt)}`}
+                            className="inline-flex items-center px-1.5 py-0.5 rounded-[3px] text-[10px] font-semibold bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300 border border-sky-200 dark:border-sky-800/70 whitespace-nowrap"
+                          >
+                            Edited
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs text-slate-700 dark:text-slate-300 font-mono">
                         {req.leaveType} · {formatDisplayDate(req.startDate)} –{' '}
@@ -312,6 +359,11 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                       <p className="text-xs text-slate-600 dark:text-slate-400">
                         {req.reason}
                       </p>
+                      {Boolean(req.editedAt) && (
+                        <p className="text-[11px] font-mono text-sky-700 dark:text-sky-400">
+                          Dates edited: {formatTimestampForDisplay(req.editedAt)}
+                        </p>
+                      )}
 
                       {!feasibility.feasible && (
                         <p className="text-xs font-semibold text-red-700 dark:text-red-400 flex items-start gap-1.5 pt-0.5">
@@ -543,6 +595,12 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                           · {req.staffId} · {req.designation}
                         </span>
                         <LeaveStatusLabel status={req.status} />
+                        {req.addedByManager && (
+                          <ManagerAddedLabel
+                            addedByName={req.addedByName}
+                            addedByStaffId={req.addedByStaffId}
+                          />
+                        )}
                       </div>
                       <p className="text-xs text-slate-700 dark:text-slate-300 font-mono">
                         {req.leaveType} · {formatDisplayDate(req.startDate)} –{' '}
@@ -552,6 +610,13 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                       {req.reason && (
                         <p className="text-xs text-slate-600 dark:text-slate-400">
                           {req.reason}
+                        </p>
+                      )}
+                      {req.addedByManager && (req.addedByName || req.addedByStaffId) && (
+                        <p className="text-[11px] text-teal-700 dark:text-teal-400">
+                          Added by Manager: {req.addedByName || req.addedByStaffId}
+                          {req.addedByStaffId && req.addedByName ? ` (${req.addedByStaffId})` : ''}
+                          {req.addedAt ? ` · ${formatTimestampForDisplay(req.addedAt)}` : ''}
                         </p>
                       )}
                       {req.reviewComment && (
@@ -611,9 +676,17 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                         aria-hidden="true"
                       />
                       <div className="min-w-0">
-                        <p className="font-semibold text-slate-900 dark:text-slate-100 truncate">
-                          {r.staffName} <span className="font-mono text-slate-500">· {r.staffId}</span>
-                        </p>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <p className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                            {r.staffName} <span className="font-mono text-slate-500">· {r.staffId}</span>
+                          </p>
+                          {r.addedByManager && (
+                            <ManagerAddedLabel
+                              addedByName={r.addedByName}
+                              addedByStaffId={r.addedByStaffId}
+                            />
+                          )}
+                        </div>
                         <p className="text-slate-500 dark:text-slate-400">
                           {r.designation} · {r.leaveType}
                         </p>
@@ -668,9 +741,17 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                         aria-hidden="true"
                       />
                       <div className="min-w-0">
-                        <p className="font-semibold text-slate-900 dark:text-slate-100 truncate">
-                          {r.staffName} <span className="font-mono text-slate-500">· {r.staffId}</span>
-                        </p>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <p className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                            {r.staffName} <span className="font-mono text-slate-500">· {r.staffId}</span>
+                          </p>
+                          {r.addedByManager && (
+                            <ManagerAddedLabel
+                              addedByName={r.addedByName}
+                              addedByStaffId={r.addedByStaffId}
+                            />
+                          )}
+                        </div>
                         <p className="text-slate-500 dark:text-slate-400">
                           {r.designation} · {r.leaveType}
                         </p>
@@ -876,6 +957,18 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
             </div>
           </div>
         </div>
+      )}
+      {isManager && onManagerAddLeave && (
+        <ManagerAddLeaveModal
+          open={addLeaveModalOpen}
+          onClose={() => setAddLeaveModalOpen(false)}
+          profiles={profiles}
+          allRequests={allRequests}
+          capacityMap={capacityMap}
+          capacityDetailsMap={capacityDetailsMap}
+          settings={settings}
+          onSubmit={onManagerAddLeave}
+        />
       )}
     </div>
   );
@@ -1101,6 +1194,7 @@ export const ReportsView: React.FC<{
         'End Date (MVT)',
         'Days',
         'Status',
+        'Source',
         'Reviewed By',
         'Review Comment',
         'Reason',
@@ -1116,6 +1210,7 @@ export const ReportsView: React.FC<{
         r.endDate,
         r.daysCount,
         r.status,
+        r.addedByManager ? 'Manager Added' : 'Staff Submitted',
         r.reviewedByName || '',
         r.reviewComment || '',
         r.reason,
@@ -1252,7 +1347,15 @@ export const ReportsView: React.FC<{
                         {r.staffId} · {r.leaveType}
                       </p>
                     </div>
-                    <LeaveStatusLabel status={r.status} />
+                    <div className="flex flex-wrap items-center gap-1.5 justify-end shrink-0">
+                      <LeaveStatusLabel status={r.status} />
+                      {r.addedByManager && (
+                        <ManagerAddedLabel
+                          addedByName={r.addedByName}
+                          addedByStaffId={r.addedByStaffId}
+                        />
+                      )}
+                    </div>
                   </div>
                   <p className="font-mono text-slate-700 dark:text-slate-200">
                     {formatDisplayDate(r.startDate)} – {formatDisplayDate(r.endDate)} ({r.daysCount}d)
@@ -1295,7 +1398,15 @@ export const ReportsView: React.FC<{
                         {r.daysCount}
                       </td>
                       <td className="py-3 pr-4 whitespace-nowrap">
-                        <LeaveStatusLabel status={r.status} />
+                        <div className="flex items-center gap-1.5">
+                          <LeaveStatusLabel status={r.status} />
+                          {r.addedByManager && (
+                            <ManagerAddedLabel
+                              addedByName={r.addedByName}
+                              addedByStaffId={r.addedByStaffId}
+                            />
+                          )}
+                        </div>
                       </td>
                       <td className="py-3 pr-4 text-slate-600 dark:text-slate-300 whitespace-nowrap">
                         {r.reviewedByName || '—'}
