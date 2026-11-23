@@ -316,7 +316,8 @@ export const ManagementQueueView: React.FC<ManagementQueueViewProps> = ({
                 capacityMap,
                 maxCap,
                 capacityDetailsMap,
-                Boolean(settings.pendingReservesCapacity)
+                Boolean(settings.pendingReservesCapacity),
+                settings.maxExecutiveDailyCap || 1
               );
               const barStyle = getLeaveBarStyle(req.designation, req.status);
               return (

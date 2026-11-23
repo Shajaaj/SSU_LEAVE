@@ -148,7 +148,9 @@ service cloud.firestore {
     function isValidDailyCapacity(data, dateKey) {
       return data.keys().hasAll(['date', 'approvedCount', 'maxCapacity', 'updatedAt'])
         && data.keys().hasOnly([
-          'date', 'approvedCount', 'approvedOnlyCount', 'pendingCount', 'maxCapacity', 'updatedAt'
+          'date', 'approvedCount', 'approvedOnlyCount', 'pendingCount', 'maxCapacity',
+          'executiveCount', 'executiveApprovedCount', 'executivePendingCount',
+          'maxExecutiveCapacity', 'updatedAt'
         ])
         && data.date == dateKey
         && isValidDateKey(data.date)
@@ -160,6 +162,10 @@ service cloud.firestore {
         && data.approvedCount <= 60
         && (!('approvedOnlyCount' in data) || (data.approvedOnlyCount is int && data.approvedOnlyCount >= 0 && data.approvedOnlyCount <= 60))
         && (!('pendingCount' in data) || (data.pendingCount is int && data.pendingCount >= 0 && data.pendingCount <= 60))
+        && (!('executiveCount' in data) || (data.executiveCount is int && data.executiveCount >= 0 && data.executiveCount <= 60))
+        && (!('executiveApprovedCount' in data) || (data.executiveApprovedCount is int && data.executiveApprovedCount >= 0 && data.executiveApprovedCount <= 60))
+        && (!('executivePendingCount' in data) || (data.executivePendingCount is int && data.executivePendingCount >= 0 && data.executivePendingCount <= 60))
+        && (!('maxExecutiveCapacity' in data) || (data.maxExecutiveCapacity is int && data.maxExecutiveCapacity >= 1 && data.maxExecutiveCapacity <= 5))
         && data.updatedAt is timestamp;
     }
 
@@ -243,10 +249,12 @@ service cloud.firestore {
           'timezone', 'unitName', 'airportName', 'updatedByStaffId', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'maxDailyCombinedCap', 'maxAnnualLeavePeriods', 'pendingReservesCapacity',
-          'timezone', 'unitName', 'airportName', 'updatedByStaffId', 'updatedAt'
+          'maxDailyCombinedCap', 'maxExecutiveDailyCap', 'maxAnnualLeavePeriods',
+          'pendingReservesCapacity', 'timezone', 'unitName', 'airportName',
+          'updatedByStaffId', 'updatedAt'
         ])
         && data.maxDailyCombinedCap is int && data.maxDailyCombinedCap >= 1 && data.maxDailyCombinedCap <= 10
+        && (!('maxExecutiveDailyCap' in data) || (data.maxExecutiveDailyCap is int && data.maxExecutiveDailyCap >= 1 && data.maxExecutiveDailyCap <= 5))
         && data.maxAnnualLeavePeriods is int && data.maxAnnualLeavePeriods >= 1 && data.maxAnnualLeavePeriods <= 10
         && data.pendingReservesCapacity is bool
         && data.timezone is string && data.timezone.size() >= 3 && data.timezone.size() <= 40

@@ -664,9 +664,19 @@ function isValidDateKey(raw: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(raw);
 }
 
+const EXECUTIVE_LIMIT_REACHED_MESSAGE =
+  'Executive Leave Limit Reached\n\n' +
+  'An Executive already has Pending or Approved leave during the selected dates.\n\n' +
+  'Only one Executive may be on leave per day.\n\n' +
+  'Please select alternative dates.';
+
 function doesDesignationCountTowardCap(designation: string): boolean {
   const norm = String(designation || '').trim().toUpperCase();
   return norm === 'ASSISTANT OFFICER' || norm === 'ATTENDANT';
+}
+
+function isExecutiveDesignation(designation: string): boolean {
+  return String(designation || '').trim().toUpperCase() === 'EXECUTIVE';
 }
 
 function expandMaldivesDateRange(
@@ -965,18 +975,51 @@ function summarizeAllocationsForDate(allocations: AllocationItem[]): {
   occupiedCount: number;
   approvedOnlyCount: number;
   pendingCount: number;
+  executiveOccupiedCount: number;
+  executiveApprovedOnlyCount: number;
+  executivePendingCount: number;
 } {
   let approvedOnlyCount = 0;
   let pendingCount = 0;
+  let executiveApprovedOnlyCount = 0;
+  let executivePendingCount = 0;
   for (const a of allocations) {
-    if (!doesDesignationCountTowardCap(a.designation)) continue;
-    if (a.status === 'pending') pendingCount += 1;
-    else approvedOnlyCount += 1;
+    if (doesDesignationCountTowardCap(a.designation)) {
+      if (a.status === 'pending') pendingCount += 1;
+      else approvedOnlyCount += 1;
+    } else if (isExecutiveDesignation(a.designation)) {
+      if (a.status === 'pending') executivePendingCount += 1;
+      else executiveApprovedOnlyCount += 1;
+    }
   }
   return {
     occupiedCount: approvedOnlyCount + pendingCount,
     approvedOnlyCount,
     pendingCount,
+    executiveOccupiedCount: executiveApprovedOnlyCount + executivePendingCount,
+    executiveApprovedOnlyCount,
+    executivePendingCount,
+  };
+}
+
+function buildDailyCapacityFields(
+  dateKey: string,
+  summary: ReturnType<typeof summarizeAllocationsForDate>,
+  capLimit: number,
+  execCapLimit: number,
+  nowIso: string
+): Record<string, FirestoreValue> {
+  return {
+    date: { stringValue: dateKey },
+    approvedCount: { integerValue: String(summary.occupiedCount) },
+    approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
+    pendingCount: { integerValue: String(summary.pendingCount) },
+    maxCapacity: { integerValue: String(capLimit) },
+    executiveCount: { integerValue: String(summary.executiveOccupiedCount) },
+    executiveApprovedCount: { integerValue: String(summary.executiveApprovedOnlyCount) },
+    executivePendingCount: { integerValue: String(summary.executivePendingCount) },
+    maxExecutiveCapacity: { integerValue: String(execCapLimit) },
+    updatedAt: { timestampValue: nowIso },
   };
 }
 
@@ -1161,7 +1204,11 @@ async function reconcilePendingCapacity(
 ): Promise<{ syncedDates: number; activeRequests: number }> {
   if (!force) {
     const settingsDoc = await fsGetDoc(projectId, accessToken, 'appSettings/portalConfig');
-    if (settingsDoc?.fields && fsBool(settingsDoc.fields, 'pendingReservesCapacity', false)) {
+    if (
+      settingsDoc?.fields &&
+      fsBool(settingsDoc.fields, 'pendingReservesCapacity', false) &&
+      settingsDoc.fields.maxExecutiveDailyCap
+    ) {
       return { syncedDates: 0, activeRequests: 0 };
     }
   }
@@ -1184,6 +1231,10 @@ async function reconcilePendingCapacity(
 
     const settingsFields = settingsDoc?.fields;
     const maxCap = Math.min(10, Math.max(1, fsInt(settingsFields, 'maxDailyCombinedCap', 10)));
+    const maxExecCap = Math.min(
+      1,
+      Math.max(1, fsInt(settingsFields, 'maxExecutiveDailyCap', 1))
+    );
     const maxAnnual = Math.min(
       10,
       Math.max(1, fsInt(settingsFields, 'maxAnnualLeavePeriods', 3))
@@ -1234,14 +1285,7 @@ async function reconcilePendingCapacity(
       writes.push({
         update: {
           name: firestoreDocResourceName(projectId, `dailyCapacity/${dateKey}`),
-          fields: {
-            date: { stringValue: dateKey },
-            approvedCount: { integerValue: String(summary.occupiedCount) },
-            approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-            pendingCount: { integerValue: String(summary.pendingCount) },
-            maxCapacity: { integerValue: String(maxCap) },
-            updatedAt: { timestampValue: nowIso },
-          },
+          fields: buildDailyCapacityFields(dateKey, summary, maxCap, maxExecCap, nowIso),
         },
       });
       writes.push({
@@ -1262,6 +1306,7 @@ async function reconcilePendingCapacity(
         name: firestoreDocResourceName(projectId, 'appSettings/portalConfig'),
         fields: {
           maxDailyCombinedCap: { integerValue: String(maxCap) },
+          maxExecutiveDailyCap: { integerValue: String(maxExecCap) },
           maxAnnualLeavePeriods: { integerValue: String(maxAnnual) },
           pendingReservesCapacity: { booleanValue: true },
           timezone: { stringValue: timezone },
@@ -2083,6 +2128,10 @@ async function handleSubmitLeave(request: Request, env: WorkerEnv): Promise<Resp
         10,
         Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
       );
+      const maxExecCap = Math.min(
+        1,
+        Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+      );
       const settingsAnnual = Math.min(
         10,
         Math.max(1, fsInt(settingsDoc?.fields, 'maxAnnualLeavePeriods', 3))
@@ -2122,14 +2171,13 @@ async function handleSubmitLeave(request: Request, env: WorkerEnv): Promise<Resp
       const nowIso = new Date().toISOString();
       const writes: FirestoreWrite[] = [];
       const fullDates: string[] = [];
+      const execFullDates: string[] = [];
+      const isExecutiveCaller = isExecutiveDesignation(caller.designation);
 
       for (const dateKey of dates) {
-        const capDoc = docsMap[`dailyCapacity/${dateKey}`];
         const detailDoc = docsMap[`dailyCapacityDetails/${dateKey}`];
-        const capLimit = Math.min(
-          10,
-          Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-        );
+        const capLimit = maxCap;
+        const execCapLimit = maxExecCap;
 
         const existingAllocs = fsAllocations(detailDoc?.fields).filter(
           (a) => a.requestId !== requestId
@@ -2151,18 +2199,15 @@ async function handleSubmitLeave(request: Request, env: WorkerEnv): Promise<Resp
           fullDates.push(`${dateKey} (${priorSummary.occupiedCount}/${capLimit})`);
           continue;
         }
+        if (isExecutiveCaller && summary.executiveOccupiedCount > execCapLimit) {
+          execFullDates.push(dateKey);
+          continue;
+        }
 
         writes.push({
           update: {
             name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-            fields: {
-              date: { stringValue: dateKey },
-              approvedCount: { integerValue: String(summary.occupiedCount) },
-              approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-              pendingCount: { integerValue: String(summary.pendingCount) },
-              maxCapacity: { integerValue: String(capLimit) },
-              updatedAt: { timestampValue: nowIso },
-            },
+            fields: buildDailyCapacityFields(dateKey, summary, capLimit, execCapLimit, nowIso),
           },
         });
         writes.push({
@@ -2177,6 +2222,9 @@ async function handleSubmitLeave(request: Request, env: WorkerEnv): Promise<Resp
         });
       }
 
+      if (execFullDates.length > 0) {
+        throw new HttpApiError(409, EXECUTIVE_LIMIT_REACHED_MESSAGE);
+      }
       if (fullDates.length > 0) {
         throw new HttpApiError(
           409,
@@ -2284,6 +2332,10 @@ async function handleCancelPendingLeave(request: Request, env: WorkerEnv): Promi
       10,
       Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
     );
+    const maxExecCap = Math.min(
+      1,
+      Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+    );
 
     const dateKeys = reqData.dates.filter(isValidDateKey);
     const capAndDetailMap = await fsBatchGetDocs(
@@ -2300,12 +2352,7 @@ async function handleCancelPendingLeave(request: Request, env: WorkerEnv): Promi
     const writes: FirestoreWrite[] = [];
 
     for (const dateKey of dateKeys) {
-      const capDoc = capAndDetailMap[`dailyCapacity/${dateKey}`];
       const detailDoc = capAndDetailMap[`dailyCapacityDetails/${dateKey}`];
-      const capLimit = Math.min(
-        10,
-        Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-      );
       const nextAllocs = fsAllocations(detailDoc?.fields).filter(
         (a) => a.requestId !== reqData.requestId
       );
@@ -2314,14 +2361,7 @@ async function handleCancelPendingLeave(request: Request, env: WorkerEnv): Promi
       writes.push({
         update: {
           name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-          fields: {
-            date: { stringValue: dateKey },
-            approvedCount: { integerValue: String(summary.occupiedCount) },
-            approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-            pendingCount: { integerValue: String(summary.pendingCount) },
-            maxCapacity: { integerValue: String(capLimit) },
-            updatedAt: { timestampValue: nowIso },
-          },
+          fields: buildDailyCapacityFields(dateKey, summary, maxCap, maxExecCap, nowIso),
         },
       });
       writes.push({
@@ -2494,6 +2534,10 @@ async function handleEditPendingLeave(request: Request, env: WorkerEnv): Promise
         10,
         Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
       );
+      const maxExecCap = Math.min(
+        1,
+        Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+      );
       const settingsAnnual = Math.min(
         10,
         Math.max(1, fsInt(settingsDoc?.fields, 'maxAnnualLeavePeriods', 3))
@@ -2556,14 +2600,13 @@ async function handleEditPendingLeave(request: Request, env: WorkerEnv): Promise
       const nowIso = new Date().toISOString();
       const writes: FirestoreWrite[] = [];
       const fullDates: string[] = [];
+      const execFullDates: string[] = [];
+      const isExecutiveReq = isExecutiveDesignation(reqData.designation);
 
       for (const dateKey of allDateKeys) {
-        const capDoc = capAndDetailMap[`dailyCapacity/${dateKey}`];
         const detailDoc = capAndDetailMap[`dailyCapacityDetails/${dateKey}`];
-        const capLimit = Math.min(
-          10,
-          Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-        );
+        const capLimit = maxCap;
+        const execCapLimit = maxExecCap;
 
         const priorAllocs = fsAllocations(detailDoc?.fields);
         let nextAllocs = priorAllocs.filter((a) => a.requestId !== reqData.requestId);
@@ -2593,18 +2636,20 @@ async function handleEditPendingLeave(request: Request, env: WorkerEnv): Promise
           fullDates.push(`${dateKey} (${priorSummary.occupiedCount}/${capLimit})`);
           continue;
         }
+        if (
+          isExecutiveReq &&
+          newDateSet.has(dateKey) &&
+          !oldDateSet.has(dateKey) &&
+          summary.executiveOccupiedCount > execCapLimit
+        ) {
+          execFullDates.push(dateKey);
+          continue;
+        }
 
         writes.push({
           update: {
             name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-            fields: {
-              date: { stringValue: dateKey },
-              approvedCount: { integerValue: String(summary.occupiedCount) },
-              approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-              pendingCount: { integerValue: String(summary.pendingCount) },
-              maxCapacity: { integerValue: String(capLimit) },
-              updatedAt: { timestampValue: nowIso },
-            },
+            fields: buildDailyCapacityFields(dateKey, summary, capLimit, execCapLimit, nowIso),
           },
         });
         writes.push({
@@ -2619,6 +2664,9 @@ async function handleEditPendingLeave(request: Request, env: WorkerEnv): Promise
         });
       }
 
+      if (execFullDates.length > 0) {
+        throw new HttpApiError(409, EXECUTIVE_LIMIT_REACHED_MESSAGE);
+      }
       if (fullDates.length > 0) {
         throw new HttpApiError(
           409,
@@ -2737,6 +2785,10 @@ async function handleApproveLeave(request: Request, env: WorkerEnv): Promise<Res
       10,
       Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
     );
+    const maxExecCap = Math.min(
+      1,
+      Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+    );
 
     const dateKeys = reqData.dates.filter(isValidDateKey);
     const capAndDetailMap = await fsBatchGetDocs(
@@ -2752,14 +2804,13 @@ async function handleApproveLeave(request: Request, env: WorkerEnv): Promise<Res
     const nowIso = new Date().toISOString();
     const writes: FirestoreWrite[] = [];
     const fullDates: string[] = [];
+    const execFullDates: string[] = [];
+    const isExecutiveReq = isExecutiveDesignation(reqData.designation);
 
     for (const dateKey of dateKeys) {
-      const capDoc = capAndDetailMap[`dailyCapacity/${dateKey}`];
       const detailDoc = capAndDetailMap[`dailyCapacityDetails/${dateKey}`];
-      const capLimit = Math.min(
-        10,
-        Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-      );
+      const capLimit = maxCap;
+      const execCapLimit = maxExecCap;
 
       const priorAllocs = fsAllocations(detailDoc?.fields);
       const wasAlreadyReserved = priorAllocs.some((a) => a.requestId === reqData.requestId);
@@ -2778,18 +2829,15 @@ async function handleApproveLeave(request: Request, env: WorkerEnv): Promise<Res
         fullDates.push(`${dateKey} (${summary.occupiedCount}/${capLimit})`);
         continue;
       }
+      if (isExecutiveReq && !wasAlreadyReserved && summary.executiveOccupiedCount > execCapLimit) {
+        execFullDates.push(dateKey);
+        continue;
+      }
 
       writes.push({
         update: {
           name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-          fields: {
-            date: { stringValue: dateKey },
-            approvedCount: { integerValue: String(summary.occupiedCount) },
-            approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-            pendingCount: { integerValue: String(summary.pendingCount) },
-            maxCapacity: { integerValue: String(capLimit) },
-            updatedAt: { timestampValue: nowIso },
-          },
+          fields: buildDailyCapacityFields(dateKey, summary, capLimit, execCapLimit, nowIso),
         },
       });
       writes.push({
@@ -2804,6 +2852,9 @@ async function handleApproveLeave(request: Request, env: WorkerEnv): Promise<Res
       });
     }
 
+    if (execFullDates.length > 0) {
+      throw new HttpApiError(409, EXECUTIVE_LIMIT_REACHED_MESSAGE);
+    }
     if (fullDates.length > 0) {
       throw new HttpApiError(409, `Approval blocked — daily limit reached on: ${fullDates.join(', ')}.`);
     }
@@ -2904,6 +2955,10 @@ async function handleRejectLeave(request: Request, env: WorkerEnv): Promise<Resp
       10,
       Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
     );
+    const maxExecCap = Math.min(
+      1,
+      Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+    );
 
     const dateKeys = reqData.dates.filter(isValidDateKey);
     const capAndDetailMap = await fsBatchGetDocs(
@@ -2920,12 +2975,7 @@ async function handleRejectLeave(request: Request, env: WorkerEnv): Promise<Resp
     const writes: FirestoreWrite[] = [];
 
     for (const dateKey of dateKeys) {
-      const capDoc = capAndDetailMap[`dailyCapacity/${dateKey}`];
       const detailDoc = capAndDetailMap[`dailyCapacityDetails/${dateKey}`];
-      const capLimit = Math.min(
-        10,
-        Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-      );
       const nextAllocs = fsAllocations(detailDoc?.fields).filter(
         (a) => a.requestId !== reqData.requestId
       );
@@ -2934,14 +2984,7 @@ async function handleRejectLeave(request: Request, env: WorkerEnv): Promise<Resp
       writes.push({
         update: {
           name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-          fields: {
-            date: { stringValue: dateKey },
-            approvedCount: { integerValue: String(summary.occupiedCount) },
-            approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-            pendingCount: { integerValue: String(summary.pendingCount) },
-            maxCapacity: { integerValue: String(capLimit) },
-            updatedAt: { timestampValue: nowIso },
-          },
+          fields: buildDailyCapacityFields(dateKey, summary, maxCap, maxExecCap, nowIso),
         },
       });
       writes.push({
@@ -3181,6 +3224,10 @@ async function handleProcessModification(request: Request, env: WorkerEnv): Prom
       10,
       Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
     );
+    const maxExecCap = Math.min(
+      1,
+      Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+    );
 
     const allDateKeys = Array.from(new Set([...reqData.dates, ...newDates]))
       .filter(isValidDateKey)
@@ -3200,14 +3247,13 @@ async function handleProcessModification(request: Request, env: WorkerEnv): Prom
 
     const writes: FirestoreWrite[] = [];
     const fullDates: string[] = [];
+    const execFullDates: string[] = [];
+    const isExecutiveReq = isExecutiveDesignation(reqData.designation);
 
     for (const dateKey of allDateKeys) {
-      const capDoc = capAndDetailMap[`dailyCapacity/${dateKey}`];
       const detailDoc = capAndDetailMap[`dailyCapacityDetails/${dateKey}`];
-      const capLimit = Math.min(
-        10,
-        Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-      );
+      const capLimit = maxCap;
+      const execCapLimit = maxExecCap;
 
       let nextAllocs = fsAllocations(detailDoc?.fields).filter(
         (a) => a.requestId !== reqData.requestId
@@ -3239,18 +3285,20 @@ async function handleProcessModification(request: Request, env: WorkerEnv): Prom
         fullDates.push(`${dateKey} (${priorSummary.occupiedCount}/${capLimit})`);
         continue;
       }
+      if (
+        isExecutiveReq &&
+        newSet.has(dateKey) &&
+        !oldSet.has(dateKey) &&
+        summary.executiveOccupiedCount > execCapLimit
+      ) {
+        execFullDates.push(dateKey);
+        continue;
+      }
 
       writes.push({
         update: {
           name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-          fields: {
-            date: { stringValue: dateKey },
-            approvedCount: { integerValue: String(summary.occupiedCount) },
-            approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-            pendingCount: { integerValue: String(summary.pendingCount) },
-            maxCapacity: { integerValue: String(capLimit) },
-            updatedAt: { timestampValue: nowIso },
-          },
+          fields: buildDailyCapacityFields(dateKey, summary, capLimit, execCapLimit, nowIso),
         },
       });
       writes.push({
@@ -3265,6 +3313,9 @@ async function handleProcessModification(request: Request, env: WorkerEnv): Prom
       });
     }
 
+    if (execFullDates.length > 0) {
+      throw new HttpApiError(409, EXECUTIVE_LIMIT_REACHED_MESSAGE);
+    }
     if (fullDates.length > 0) {
       throw new HttpApiError(
         409,
@@ -3426,6 +3477,10 @@ async function handleRemoveApprovedLeave(request: Request, env: WorkerEnv): Prom
       10,
       Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
     );
+    const maxExecCap = Math.min(
+      1,
+      Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+    );
 
     const dateKeys = reqData.dates.filter(isValidDateKey);
     const capAndDetailMap = await fsBatchGetDocs(
@@ -3442,13 +3497,7 @@ async function handleRemoveApprovedLeave(request: Request, env: WorkerEnv): Prom
     const writes: FirestoreWrite[] = [];
 
     for (const dateKey of dateKeys) {
-      const capDoc = capAndDetailMap[`dailyCapacity/${dateKey}`];
       const detailDoc = capAndDetailMap[`dailyCapacityDetails/${dateKey}`];
-      const capLimit = Math.min(
-        10,
-        Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-      );
-
       const nextAllocs = fsAllocations(detailDoc?.fields).filter(
         (a) => a.requestId !== reqData.requestId
       );
@@ -3457,14 +3506,7 @@ async function handleRemoveApprovedLeave(request: Request, env: WorkerEnv): Prom
       writes.push({
         update: {
           name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-          fields: {
-            date: { stringValue: dateKey },
-            approvedCount: { integerValue: String(summary.occupiedCount) },
-            approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-            pendingCount: { integerValue: String(summary.pendingCount) },
-            maxCapacity: { integerValue: String(capLimit) },
-            updatedAt: { timestampValue: nowIso },
-          },
+          fields: buildDailyCapacityFields(dateKey, summary, maxCap, maxExecCap, nowIso),
         },
       });
       writes.push({
@@ -3663,20 +3705,20 @@ async function handleManagerAddLeave(request: Request, env: WorkerEnv): Promise<
         10,
         Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
       );
+      const maxExecCap = Math.min(
+        1,
+        Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+      );
+      const targetIsExecutive = isExecutiveDesignation(targetDesignation);
 
       const nowIso = new Date().toISOString();
       const writes: FirestoreWrite[] = [];
       let peakOccupied = 0;
+      let peakExecOccupied = 0;
 
-      // Manager-added leave bypasses 3-period annual limit, 10-slot daily cap, blocked dates, and (with confirmation) overlaps
+      // Manager-added leave bypasses 3-period annual limit, 10-slot daily cap, 1-slot Executive cap, blocked dates, and (with confirmation) overlaps
       for (const dateKey of dates) {
-        const capDoc = docsMap[`dailyCapacity/${dateKey}`];
         const detailDoc = docsMap[`dailyCapacityDetails/${dateKey}`];
-        const capLimit = Math.min(
-          10,
-          Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-        );
-
         const nextAllocs = fsAllocations(detailDoc?.fields).filter(
           (a) => a.requestId !== requestId
         );
@@ -3693,18 +3735,14 @@ async function handleManagerAddLeave(request: Request, env: WorkerEnv): Promise<
         if (summary.occupiedCount > peakOccupied) {
           peakOccupied = summary.occupiedCount;
         }
+        if (summary.executiveOccupiedCount > peakExecOccupied) {
+          peakExecOccupied = summary.executiveOccupiedCount;
+        }
 
         writes.push({
           update: {
             name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-            fields: {
-              date: { stringValue: dateKey },
-              approvedCount: { integerValue: String(summary.occupiedCount) },
-              approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-              pendingCount: { integerValue: String(summary.pendingCount) },
-              maxCapacity: { integerValue: String(capLimit) },
-              updatedAt: { timestampValue: nowIso },
-            },
+            fields: buildDailyCapacityFields(dateKey, summary, maxCap, maxExecCap, nowIso),
           },
         });
         writes.push({
@@ -3756,7 +3794,9 @@ async function handleManagerAddLeave(request: Request, env: WorkerEnv): Promise<
       const overCapNote =
         targetCountsTowardCap && peakOccupied > maxCap
           ? ` (peak daily occupancy ${peakOccupied}/${maxCap})`
-          : '';
+          : targetIsExecutive && peakExecOccupied > maxExecCap
+            ? ` (peak Executive occupancy ${peakExecOccupied}/${maxExecCap})`
+            : '';
       const overlapNote = overlappingDates.length > 0 ? ' (overlap confirmed)' : '';
 
       writes.push({
@@ -3858,6 +3898,10 @@ async function handleRemoveStaff(request: Request, env: WorkerEnv): Promise<Resp
         10,
         Math.max(1, fsInt(settingsDoc?.fields, 'maxDailyCombinedCap', 10))
       );
+      const maxExecCap = Math.min(
+        1,
+        Math.max(1, fsInt(settingsDoc?.fields, 'maxExecutiveDailyCap', 1))
+      );
 
       const affectedDatesSet = new Set<string>();
       const removedReqIds = new Set<string>();
@@ -3887,12 +3931,7 @@ async function handleRemoveStaff(request: Request, env: WorkerEnv): Promise<Resp
       const writes: FirestoreWrite[] = [];
 
       for (const dateKey of affectedDates) {
-        const capDoc = capAndDetailMap[`dailyCapacity/${dateKey}`];
         const detailDoc = capAndDetailMap[`dailyCapacityDetails/${dateKey}`];
-        const capLimit = Math.min(
-          10,
-          Math.max(1, fsInt(capDoc?.fields, 'maxCapacity', maxCap))
-        );
         const nextAllocs = fsAllocations(detailDoc?.fields).filter(
           (a) => a.staffId !== targetStaffId && !removedReqIds.has(a.requestId)
         );
@@ -3901,14 +3940,7 @@ async function handleRemoveStaff(request: Request, env: WorkerEnv): Promise<Resp
         writes.push({
           update: {
             name: firestoreDocResourceName(caller.projectId, `dailyCapacity/${dateKey}`),
-            fields: {
-              date: { stringValue: dateKey },
-              approvedCount: { integerValue: String(summary.occupiedCount) },
-              approvedOnlyCount: { integerValue: String(summary.approvedOnlyCount) },
-              pendingCount: { integerValue: String(summary.pendingCount) },
-              maxCapacity: { integerValue: String(capLimit) },
-              updatedAt: { timestampValue: nowIso },
-            },
+            fields: buildDailyCapacityFields(dateKey, summary, maxCap, maxExecCap, nowIso),
           },
         });
         writes.push({

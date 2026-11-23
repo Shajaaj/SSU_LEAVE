@@ -18,6 +18,8 @@ import { findRestrictedDatesForStaff } from '../utils/leaveRestrictions';
 import {
   calculateAnnualPeriodUsage,
   getDailyCapacityBreakdown,
+  getExecutiveCapacityBreakdown,
+  isExecutiveDesignation,
   validateLeaveSubmission,
 } from '../utils/leaveRules';
 import {
@@ -32,6 +34,7 @@ interface LeaveRequestModalProps {
   onClose: () => void;
   staff: StaffProfile;
   userRequests: LeaveRequest[];
+  allRequests?: LeaveRequest[];
   capacityMap: Record<string, DailyCapacity>;
   capacityDetailsMap?: Record<string, DailyCapacityDetail>;
   pendingDemandMap: Record<string, number>;
@@ -56,6 +59,7 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
   onClose,
   staff,
   userRequests,
+  allRequests,
   capacityMap,
   capacityDetailsMap,
   pendingDemandMap,
@@ -150,6 +154,8 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
     [userRequests, staff.staffId, calendarYear, staff.annualPeriodLimit, settings.maxAnnualLeavePeriods]
   );
 
+  const isExecutiveApplicant = isExecutiveDesignation(staff.designation);
+
   const validation = useMemo(
     () =>
       validateLeaveSubmission({
@@ -158,6 +164,7 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
         endDate,
         reason,
         userRequests,
+        allRequests,
         capacityMap: mergedCapacityMap,
         pendingDemandMap,
         capacityDetailsMap: mergedDetailsMap,
@@ -170,6 +177,7 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
       endDate,
       reason,
       userRequests,
+      allRequests,
       mergedCapacityMap,
       pendingDemandMap,
       mergedDetailsMap,
@@ -405,11 +413,15 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
                   <Calendar className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" aria-hidden="true" />
                   <span>Date-by-Date Capacity Check ({validation.dates.length} day{validation.dates.length > 1 ? 's' : ''})</span>
                 </span>
-                {!staff.countsTowardDailyCap && (
+                {isExecutiveApplicant ? (
+                  <span className="text-[11px] text-purple-700 dark:text-purple-300 font-medium">
+                    Executive daily limit: max {settings.maxExecutiveDailyCap || 1}/day
+                  </span>
+                ) : !staff.countsTowardDailyCap ? (
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
                     Exempt from 10-slot Assistant/Attendant cap
                   </span>
-                )}
+                ) : null}
               </div>
               <div className="max-h-36 overflow-y-auto border border-slate-200 dark:border-slate-800 rounded-lg divide-y divide-slate-100 dark:divide-slate-800">
                 {validation.dates.map((d) => {
@@ -421,7 +433,27 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
                     defaultMaxCap: settings.maxDailyCombinedCap || 10,
                     pendingReservesCapacity: Boolean(settings.pendingReservesCapacity),
                   });
-                  const isCapFull = staff.countsTowardDailyCap && breakdown.isFull;
+                  const execBreakdown = isExecutiveApplicant
+                    ? getExecutiveCapacityBreakdown({
+                        dateKey: d,
+                        capacityMap: mergedCapacityMap,
+                        capacityDetailsMap: mergedDetailsMap,
+                        defaultMaxExecCap: settings.maxExecutiveDailyCap || 1,
+                        allRequests,
+                      })
+                    : null;
+                  const activeOccupied = execBreakdown
+                    ? execBreakdown.occupiedCount
+                    : breakdown.occupiedCount;
+                  const activeMax = execBreakdown
+                    ? execBreakdown.maxCapacity
+                    : breakdown.maxCapacity;
+                  const activePending = execBreakdown
+                    ? execBreakdown.pendingCount
+                    : breakdown.pendingCount;
+                  const isCapFull = isExecutiveApplicant
+                    ? Boolean(execBreakdown?.isFull)
+                    : staff.countsTowardDailyCap && breakdown.isFull;
                   const isRestricted = blockedDatesSet.has(d);
                   const blocked = isCapFull || isRestricted;
                   return (
@@ -440,9 +472,9 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
                             Restricted
                           </span>
                         )}
-                        {breakdown.pendingCount > 0 && (
+                        {activePending > 0 && (
                           <span className="text-[11px] text-blue-700 dark:text-blue-300">
-                            {breakdown.pendingCount} pending
+                            {activePending} pending
                           </span>
                         )}
                         <span
@@ -452,7 +484,7 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
                               : 'text-emerald-700 dark:text-emerald-400'
                           }`}
                         >
-                          {breakdown.occupiedCount}/{breakdown.maxCapacity} occupied {isCapFull ? '(FULL)' : ''}
+                          {activeOccupied}/{activeMax} occupied {isCapFull ? '(FULL)' : ''}
                         </span>
                       </div>
                     </div>
@@ -509,21 +541,22 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
             </div>
           ) : (validation.errors.length > 0 && reason.length > 0) ||
             validation.unavailableDates.length > 0 ||
+            validation.executiveUnavailableDates.length > 0 ||
             activeBlockedDates.length > 0 ||
             annualUsage.remainingPeriods === 0 ||
             submitError ? (
             <div
               role="alert"
-              className="p-3.5 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-800 dark:text-red-200 space-y-1"
+              className="p-3.5 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-800 dark:text-red-200 space-y-1.5"
             >
               {submitError && (
-                <p className="flex items-start gap-2 font-semibold">
+                <p className="flex items-start gap-2 font-semibold whitespace-pre-line">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" />
                   <span>{submitError}</span>
                 </p>
               )}
               {validation.errors.map((errMsg, idx) => (
-                <p key={idx} className="flex items-start gap-2">
+                <p key={idx} className="flex items-start gap-2 whitespace-pre-line">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" />
                   <span>{errMsg}</span>
                 </p>
@@ -535,9 +568,11 @@ export const LeaveRequestModal: React.FC<LeaveRequestModalProps> = ({
                 <CheckCircle2 className="w-4 h-4 shrink-0" aria-hidden="true" />
                 <span>
                   All {validation.dates.length} day{validation.dates.length > 1 ? 's' : ''} verified within capacity.{' '}
-                  {staff.countsTowardDailyCap
-                    ? 'Submitting immediately reserves daily slots while Pending.'
-                    : 'Executive, Officer, and Manager leave does not consume the 10-slot Assistant Officer & Attendant cap.'}
+                  {isExecutiveApplicant
+                    ? 'Submitting immediately reserves your daily Executive slot while Pending.'
+                    : staff.countsTowardDailyCap
+                      ? 'Submitting immediately reserves daily slots while Pending.'
+                      : 'Officer and Manager leave does not consume daily staff or Executive caps.'}
                 </span>
               </div>
             )

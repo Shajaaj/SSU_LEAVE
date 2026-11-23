@@ -124,6 +124,7 @@ export default function App() {
   const [restrictionsError, setRestrictionsError] = useState<string | null>(null);
   const [loadingRequests, setLoadingRequests] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [needsCapacitySync, setNeedsCapacitySync] = useState(false);
   const syncedPendingRef = useRef(false);
   const restrictionsFallbackRef = useRef(false);
 
@@ -169,6 +170,7 @@ export default function App() {
     setRestrictionsError(null);
     setLoadingRequests(false);
     setSettingsLoaded(false);
+    setNeedsCapacitySync(false);
     syncedPendingRef.current = false;
     restrictionsFallbackRef.current = false;
   }, []);
@@ -233,10 +235,14 @@ export default function App() {
         },
         onSubError
       ),
-      subscribeSettings((nextSettings) => {
-        setLiveSettings(nextSettings);
-        setSettingsLoaded(true);
-      }, onSubError),
+      subscribeSettings(
+        (nextSettings) => {
+          setLiveSettings(nextSettings);
+          setSettingsLoaded(true);
+        },
+        onSubError,
+        setNeedsCapacitySync
+      ),
       subscribeMyRequests(
         activeStaffId,
         (items) => {
@@ -311,12 +317,12 @@ export default function App() {
     };
   }, [activeStaffId, calendarYear, calendarMonth0, addToast]);
 
-  // One-time automatic backfill so existing Pending requests reserve daily slots immediately
+  // One-time automatic backfill so existing Pending & Executive requests reserve daily slots immediately
   useEffect(() => {
     if (
       !activeStaffId ||
       !settingsLoaded ||
-      liveSettings.pendingReservesCapacity ||
+      (!needsCapacitySync && liveSettings.pendingReservesCapacity) ||
       syncedPendingRef.current
     ) {
       return;
@@ -325,7 +331,7 @@ export default function App() {
     void syncPendingCapacity(false).catch(() => {
       syncedPendingRef.current = false;
     });
-  }, [activeStaffId, settingsLoaded, liveSettings.pendingReservesCapacity]);
+  }, [activeStaffId, settingsLoaded, needsCapacitySync, liveSettings.pendingReservesCapacity]);
 
   const handleLoginSuccess = (user: StaffProfile) => {
     setAuthErrorBanner(null);
@@ -599,6 +605,7 @@ export default function App() {
 
   const handleUpdateSettings = async (next: {
     maxDailyCombinedCap: number;
+    maxExecutiveDailyCap: number;
     maxAnnualLeavePeriods: number;
   }) => {
     if (!liveProfile) return;
@@ -737,6 +744,7 @@ export default function App() {
         <MyRequestsView
           profile={liveProfile}
           requests={liveMyRequests}
+          allRequests={activeAllRequests}
           restrictions={liveRestrictions}
           capacityMap={liveCapacityMap}
           capacityDetailsMap={liveCapacityDetailsMap}
@@ -790,6 +798,7 @@ export default function App() {
         <AdministrationView
           currentProfile={liveProfile}
           profiles={liveProfiles}
+          allRequests={activeAllRequests}
           settings={liveSettings}
           restrictions={liveRestrictions}
           onAddStaff={handleAddStaff}
@@ -818,6 +827,7 @@ export default function App() {
         onClose={() => setNewReqModalOpen(false)}
         staff={liveProfile}
         userRequests={liveMyRequests}
+        allRequests={activeAllRequests}
         capacityMap={liveCapacityMap}
         capacityDetailsMap={liveCapacityDetailsMap}
         pendingDemandMap={pendingDemandMap}

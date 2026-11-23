@@ -21,6 +21,8 @@ import {
   buildPendingDemandMap,
   calculateAnnualPeriodUsage,
   getDailyCapacityBreakdown,
+  getExecutiveCapacityBreakdown,
+  isExecutiveDesignation,
 } from '../utils/leaveRules';
 import {
   expandDateRange,
@@ -57,6 +59,7 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
 }) => {
   const today = getTodayInMaldives();
   const maxDailyCap = settings.maxDailyCombinedCap || 10;
+  const maxExecDailyCap = Math.max(1, settings.maxExecutiveDailyCap || 1);
 
   const [staffSearch, setStaffSearch] = useState('');
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -200,6 +203,10 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
     };
   }, [selectedStaff, expandedRange.dates, allRequests]);
 
+  const targetIsExecutive = Boolean(
+    selectedStaff && isExecutiveDesignation(selectedStaff.designation)
+  );
+
   const capacityPreview = useMemo(() => {
     const countsTowardCap = Boolean(selectedStaff?.countsTowardDailyCap);
     return expandedRange.dates.map((dateKey) => {
@@ -211,13 +218,38 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
         defaultMaxCap: maxDailyCap,
         pendingReservesCapacity: Boolean(settings.pendingReservesCapacity),
       });
-      const projectedOccupied = countsTowardCap
-        ? breakdown.occupiedCount + 1
+      const execBreakdown = getExecutiveCapacityBreakdown({
+        dateKey,
+        capacityMap: mergedCapacityMap,
+        capacityDetailsMap: mergedDetailsMap,
+        defaultMaxExecCap: maxExecDailyCap,
+        allRequests,
+      });
+
+      const currentOccupied = targetIsExecutive
+        ? execBreakdown.occupiedCount
         : breakdown.occupiedCount;
-      const willExceedCap = countsTowardCap && projectedOccupied > breakdown.maxCapacity;
+      const currentApproved = targetIsExecutive
+        ? execBreakdown.approvedOnlyCount
+        : breakdown.approvedOnlyCount;
+      const currentPending = targetIsExecutive
+        ? execBreakdown.pendingCount
+        : breakdown.pendingCount;
+      const activeMaxCap = targetIsExecutive
+        ? execBreakdown.maxCapacity
+        : breakdown.maxCapacity;
+
+      const projectedOccupied =
+        countsTowardCap || targetIsExecutive ? currentOccupied + 1 : currentOccupied;
+      const willExceedCap =
+        (countsTowardCap || targetIsExecutive) && projectedOccupied > activeMaxCap;
+
       return {
         dateKey,
-        ...breakdown,
+        occupiedCount: currentOccupied,
+        approvedOnlyCount: currentApproved,
+        pendingCount: currentPending,
+        maxCapacity: activeMaxCap,
         projectedOccupied,
         willExceedCap,
       };
@@ -225,10 +257,13 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
   }, [
     expandedRange.dates,
     selectedStaff,
+    targetIsExecutive,
     mergedCapacityMap,
     pendingDemandMap,
     mergedDetailsMap,
     maxDailyCap,
+    maxExecDailyCap,
+    allRequests,
     settings.pendingReservesCapacity,
   ]);
 
@@ -428,7 +463,12 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
                             <span>{p.fullName}</span>
                           </p>
                           <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                            {p.designation} · {p.countsTowardDailyCap ? 'Counts toward 10-slot cap' : 'Exempt from 10-slot cap'}
+                            {p.designation} ·{' '}
+                            {isExecutiveDesignation(p.designation)
+                              ? `Executive daily cap (${maxExecDailyCap}/day)`
+                              : p.countsTowardDailyCap
+                                ? 'Counts toward 10-slot cap'
+                                : 'Exempt from daily caps'}
                           </p>
                         </div>
                         {isSelected && (
@@ -455,9 +495,11 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
                       {selectedStaff.designation}
                     </span>
                     <span className="text-[10px] font-medium text-slate-500 dark:text-slate-400">
-                      {selectedStaff.countsTowardDailyCap
-                        ? 'Cap-counted'
-                        : 'Cap-exempt'}
+                      {targetIsExecutive
+                        ? `Exec cap (${maxExecDailyCap}/day)`
+                        : selectedStaff.countsTowardDailyCap
+                          ? 'Cap-counted'
+                          : 'Cap-exempt'}
                     </span>
                   </>
                 ) : (
@@ -570,7 +612,11 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
                 )}
                 {hasOverCapacityDate && (
                   <p>
-                    • One or more selected dates will exceed the standard {maxDailyCap}-slot daily cap — allowed for Manager-added leave (normal staff remain blocked).
+                    • One or more selected dates will exceed the standard{' '}
+                    {targetIsExecutive
+                      ? `Executive daily cap (${maxExecDailyCap}/day)`
+                      : `${maxDailyCap}-slot daily cap`}{' '}
+                    — allowed for Manager-added leave (normal staff remain blocked).
                   </p>
                 )}
               </div>
@@ -630,9 +676,11 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
                 </span>
                 <span className="text-[11px] text-slate-500 dark:text-slate-400">
                   {selectedStaff
-                    ? selectedStaff.countsTowardDailyCap
-                      ? 'Assistant Officer / Attendant (+1 slot/day)'
-                      : `${selectedStaff.designation} (Exempt from 10-slot cap)`
+                    ? targetIsExecutive
+                      ? `Executive daily cap (+1 slot/day, max ${maxExecDailyCap})`
+                      : selectedStaff.countsTowardDailyCap
+                        ? 'Assistant Officer / Attendant (+1 slot/day)'
+                        : `${selectedStaff.designation} (Exempt from daily caps)`
                     : `Standard combined cap: ${maxDailyCap}/day`}
                 </span>
               </div>
@@ -665,7 +713,7 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
                       {selectedStaff && (
                         <>
                           <span className="text-slate-400">→</span>
-                          {selectedStaff.countsTowardDailyCap ? (
+                          {selectedStaff.countsTowardDailyCap || targetIsExecutive ? (
                             <span
                               className={`px-1.5 py-0.5 rounded font-bold ${
                                 d.willExceedCap

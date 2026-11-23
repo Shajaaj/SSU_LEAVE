@@ -87,6 +87,10 @@ export interface DailyCapacity {
   approvedOnlyCount?: number;
   pendingCount?: number;
   maxCapacity: number;
+  executiveCount?: number; // Combined occupied Executive slots (Pending + Approved for Executives)
+  executiveApprovedCount?: number;
+  executivePendingCount?: number;
+  maxExecutiveCapacity?: number;
   updatedAt?: unknown;
 }
 
@@ -166,6 +170,7 @@ export interface LeaveRestriction {
 
 export interface AppSettings {
   maxDailyCombinedCap: number;
+  maxExecutiveDailyCap: number;
   maxAnnualLeavePeriods: number;
   pendingReservesCapacity: boolean;
   timezone: string;

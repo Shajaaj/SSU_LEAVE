@@ -16,6 +16,8 @@ import {
 import { findRestrictedDatesForStaff } from '../utils/leaveRestrictions';
 import {
   getDailyCapacityBreakdown,
+  getExecutiveCapacityBreakdown,
+  isExecutiveDesignation,
   validateLeaveSubmission,
 } from '../utils/leaveRules';
 import { expandDateRange, formatDisplayDate } from '../utils/maldivesDate';
@@ -29,6 +31,7 @@ interface EditPendingLeaveModalProps {
   targetRequest: LeaveRequest | null;
   liveRequest: LeaveRequest | null;
   userRequests: LeaveRequest[];
+  allRequests?: LeaveRequest[];
   capacityMap: Record<string, DailyCapacity>;
   capacityDetailsMap?: Record<string, DailyCapacityDetail>;
   pendingDemandMap: Record<string, number>;
@@ -51,6 +54,7 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
   targetRequest,
   liveRequest,
   userRequests,
+  allRequests,
   capacityMap,
   capacityDetailsMap,
   pendingDemandMap,
@@ -127,6 +131,8 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
     [extraDetailsMap, capacityDetailsMap]
   );
 
+  const isExecutiveApplicant = isExecutiveDesignation(staff.designation);
+
   const validation = useMemo(() => {
     if (!targetRequest) {
       return {
@@ -134,6 +140,7 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
         dates: [] as string[],
         errors: [] as string[],
         unavailableDates: [],
+        executiveUnavailableDates: [],
         pendingOverlapDates: [],
         blockedDates: [] as string[],
         matchedRestrictions: [] as LeaveRestriction[],
@@ -150,6 +157,7 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
       endDate: newEndDate,
       reason: effectiveReason,
       userRequests,
+      allRequests,
       capacityMap: mergedCapacityMap,
       pendingDemandMap,
       capacityDetailsMap: mergedDetailsMap,
@@ -163,6 +171,7 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
     newStartDate,
     newEndDate,
     userRequests,
+    allRequests,
     mergedCapacityMap,
     pendingDemandMap,
     mergedDetailsMap,
@@ -435,9 +444,25 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
                     defaultMaxCap: settings.maxDailyCombinedCap || 10,
                     pendingReservesCapacity: Boolean(settings.pendingReservesCapacity),
                   });
+                  const execBreakdown = isExecutiveApplicant
+                    ? getExecutiveCapacityBreakdown({
+                        dateKey: d,
+                        capacityMap: mergedCapacityMap,
+                        capacityDetailsMap: mergedDetailsMap,
+                        defaultMaxExecCap: settings.maxExecutiveDailyCap || 1,
+                        allRequests,
+                      })
+                    : null;
+                  const activeOccupied = execBreakdown
+                    ? execBreakdown.occupiedCount
+                    : breakdown.occupiedCount;
+                  const activeMax = execBreakdown
+                    ? execBreakdown.maxCapacity
+                    : breakdown.maxCapacity;
                   const alreadyReserved = oldDatesSet.has(d);
-                  const isCapFull =
-                    staff.countsTowardDailyCap && breakdown.isFull && !alreadyReserved;
+                  const isCapFull = isExecutiveApplicant
+                    ? Boolean(execBreakdown?.isFull) && !alreadyReserved
+                    : staff.countsTowardDailyCap && breakdown.isFull && !alreadyReserved;
                   const isRestricted = blockedDatesSet.has(d);
                   const blocked = isCapFull || isRestricted;
                   return (
@@ -468,7 +493,7 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
                               : 'text-emerald-700 dark:text-emerald-400'
                           }`}
                         >
-                          {breakdown.occupiedCount}/{breakdown.maxCapacity} occupied{' '}
+                          {activeOccupied}/{activeMax} occupied{' '}
                           {isCapFull ? '(FULL)' : ''}
                         </span>
                       </div>
@@ -484,16 +509,16 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
           (validation.errors.length > 0 || activeBlockedDates.length > 0 || saveError) ? (
             <div
               role="alert"
-              className="p-3.5 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-800 dark:text-red-200 space-y-1"
+              className="p-3.5 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-800 dark:text-red-200 space-y-1.5"
             >
               {saveError && (
-                <p className="flex items-start gap-2 font-semibold">
+                <p className="flex items-start gap-2 font-semibold whitespace-pre-line">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" />
                   <span>{saveError}</span>
                 </p>
               )}
               {validation.errors.map((errMsg, idx) => (
-                <p key={idx} className="flex items-start gap-2">
+                <p key={idx} className="flex items-start gap-2 whitespace-pre-line">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" />
                   <span>{errMsg}</span>
                 </p>

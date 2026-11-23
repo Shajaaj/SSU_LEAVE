@@ -22,6 +22,7 @@ import { LeaveStatusLabel, ManagerAddedLabel } from './StatusLabel';
 interface MyRequestsViewProps {
   profile: StaffProfile;
   requests: LeaveRequest[];
+  allRequests?: LeaveRequest[];
   restrictions?: LeaveRestriction[];
   capacityMap?: Record<string, DailyCapacity>;
   capacityDetailsMap?: Record<string, DailyCapacityDetail>;
@@ -47,12 +48,14 @@ interface MyRequestsViewProps {
 export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
   profile,
   requests,
+  allRequests,
   restrictions = [],
   capacityMap = {},
   capacityDetailsMap = {},
   pendingDemandMap = {},
   settings = {
     maxDailyCombinedCap: 10,
+    maxExecutiveDailyCap: 1,
     maxAnnualLeavePeriods: 3,
     pendingReservesCapacity: true,
     timezone: 'Asia/Male',
@@ -366,7 +369,7 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
             </p>
 
             {modError && (
-              <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-700 dark:text-red-300 flex items-start gap-2">
+              <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-xs text-red-700 dark:text-red-300 flex items-start gap-2 whitespace-pre-line">
                 <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" aria-hidden="true" />
                 <span>{modError}</span>
               </div>
@@ -461,6 +464,7 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
         targetRequest={editTarget}
         liveRequest={liveEditTarget}
         userRequests={requests}
+        allRequests={allRequests}
         capacityMap={capacityMap}
         capacityDetailsMap={capacityDetailsMap}
         pendingDemandMap={pendingDemandMap}

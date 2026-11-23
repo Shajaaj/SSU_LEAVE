@@ -303,7 +303,7 @@
     },
     "DailyCapacity": {
       "title": "DailyCapacity",
-      "description": "Atomic daily capacity counter (standard max 10 combined Pending + Approved allocations for Assistant Officers and Attendants; may exceed 10 when Manager-added leave overrides capacity).",
+      "description": "Atomic daily capacity counter (standard max 10 combined Pending + Approved allocations for Assistant Officers and Attendants; independent Executive counter max 1; may exceed cap when Manager-added leave overrides capacity).",
       "type": "object",
       "properties": {
         "date": {
@@ -323,6 +323,19 @@
           "type": "integer"
         },
         "maxCapacity": {
+          "type": "integer"
+        },
+        "executiveCount": {
+          "type": "integer",
+          "description": "Combined occupied Executive daily slots (Pending + Approved Executives)."
+        },
+        "executiveApprovedCount": {
+          "type": "integer"
+        },
+        "executivePendingCount": {
+          "type": "integer"
+        },
+        "maxExecutiveCapacity": {
           "type": "integer"
         },
         "updatedAt": {
@@ -452,6 +465,9 @@
       "type": "object",
       "properties": {
         "maxDailyCombinedCap": {
+          "type": "integer"
+        },
+        "maxExecutiveDailyCap": {
           "type": "integer"
         },
         "maxAnnualLeavePeriods": {

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   CalendarOff,
@@ -20,18 +20,24 @@ import {
   AppSettings,
   AuditLog,
   Designation,
+  LeaveRequest,
   LeaveRestriction,
   RestrictionTargetType,
   StaffProfile,
   UserRole,
 } from '../types/portal';
 import { downloadCsv } from '../utils/csvExport';
+import { calculateOverCapacityDates } from '../utils/leaveRules';
 import {
   RESTRICTION_TARGET_OPTIONS,
   formatRestrictionRangeShort,
   formatRestrictionTargetLabel,
 } from '../utils/leaveRestrictions';
-import { formatTimestampForDisplay, getTodayInMaldives } from '../utils/maldivesDate';
+import {
+  formatDisplayDate,
+  formatTimestampForDisplay,
+  getTodayInMaldives,
+} from '../utils/maldivesDate';
 import { isValidStaffIdFormat, normalizeStaffIdToken } from '../utils/staffAuthId';
 import { StaffStatusLabel } from './StatusLabel';
 
@@ -42,6 +48,7 @@ import { StaffStatusLabel } from './StatusLabel';
 interface AdministrationViewProps {
   currentProfile: StaffProfile;
   profiles: StaffProfile[];
+  allRequests?: LeaveRequest[];
   settings: AppSettings;
   restrictions?: LeaveRestriction[];
   onAddStaff?: (payload: {
@@ -65,6 +72,7 @@ interface AdministrationViewProps {
   onResetStaffPin?: (target: StaffProfile, tempPin: string) => Promise<void>;
   onUpdateSettings: (next: {
     maxDailyCombinedCap: number;
+    maxExecutiveDailyCap: number;
     maxAnnualLeavePeriods: number;
   }) => Promise<void>;
   onSaveRestriction?: (payload: {
@@ -82,6 +90,7 @@ interface AdministrationViewProps {
 export const AdministrationView: React.FC<AdministrationViewProps> = ({
   currentProfile,
   profiles,
+  allRequests = [],
   settings,
   restrictions = [],
   onAddStaff,
@@ -126,10 +135,28 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
 
   // Settings State
   const [maxDailyCap, setMaxDailyCap] = useState(settings.maxDailyCombinedCap || 10);
+  const [maxExecDailyCap, setMaxExecDailyCap] = useState(
+    settings.maxExecutiveDailyCap || 1
+  );
   const [maxAnnualPeriods, setMaxAnnualPeriods] = useState(
     settings.maxAnnualLeavePeriods || 3
   );
   const [savingSettings, setSavingSettings] = useState(false);
+
+  useEffect(() => {
+    setMaxDailyCap(settings.maxDailyCombinedCap || 10);
+    setMaxExecDailyCap(settings.maxExecutiveDailyCap || 1);
+    setMaxAnnualPeriods(settings.maxAnnualLeavePeriods || 3);
+  }, [
+    settings.maxDailyCombinedCap,
+    settings.maxExecutiveDailyCap,
+    settings.maxAnnualLeavePeriods,
+  ]);
+
+  const overCapacityDates = useMemo(
+    () => calculateOverCapacityDates(allRequests, settings),
+    [allRequests, settings]
+  );
 
   // Leave Date Restrictions State
   const todayMaldives = getTodayInMaldives();
@@ -334,6 +361,7 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
     try {
       await onUpdateSettings({
         maxDailyCombinedCap: Math.min(10, Math.max(1, maxDailyCap)),
+        maxExecutiveDailyCap: Math.min(1, Math.max(1, maxExecDailyCap)),
         maxAnnualLeavePeriods: Math.min(10, Math.max(1, maxAnnualPeriods)),
       });
     } finally {
@@ -504,7 +532,7 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
             Unit Policy Configuration
           </h2>
         </div>
-        <form onSubmit={handleSaveSettings} className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
+        <form onSubmit={handleSaveSettings} className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
           <div>
             <label htmlFor="cfg-cap" className="block text-xs font-semibold mb-1">
               Daily Combined Cap (Max 10)
@@ -516,6 +544,20 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
               max={10}
               value={maxDailyCap}
               onChange={(e) => setMaxDailyCap(Number(e.target.value))}
+              className="w-full min-h-[42px] sm:min-h-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-xs font-mono"
+            />
+          </div>
+          <div>
+            <label htmlFor="cfg-exec-cap" className="block text-xs font-semibold mb-1">
+              Executive Daily Leave Cap (Max 1)
+            </label>
+            <input
+              id="cfg-exec-cap"
+              type="number"
+              min={1}
+              max={1}
+              value={maxExecDailyCap}
+              onChange={(e) => setMaxExecDailyCap(Number(e.target.value))}
               className="w-full min-h-[42px] sm:min-h-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-xs font-mono"
             />
           </div>
@@ -533,9 +575,9 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
               className="w-full min-h-[42px] sm:min-h-0 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#07111E] text-base sm:text-xs font-mono"
             />
           </div>
-          <div className="sm:col-span-2 flex flex-wrap items-center justify-between gap-3">
+          <div className="sm:col-span-3 flex flex-wrap items-center justify-between gap-3">
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Policy: Both Pending and Approved Assistant Officer / Attendant applications reserve daily slots immediately (max 10/day). Rejecting or cancelling releases slots automatically. Timezone fixed to <span className="font-mono">Asia/Male</span>.
+              Policy: Both Pending and Approved Assistant Officer / Attendant applications reserve daily slots immediately (max {settings.maxDailyCombinedCap || 10}/day). Executives follow an independent daily cap (max {settings.maxExecutiveDailyCap || 1}/day). Rejecting or cancelling releases slots automatically. Timezone fixed to <span className="font-mono">Asia/Male</span>.
             </p>
             <button
               type="submit"
@@ -546,6 +588,45 @@ export const AdministrationView: React.FC<AdministrationViewProps> = ({
             </button>
           </div>
         </form>
+
+        {overCapacityDates.length > 0 && (
+          <div className="rounded-lg border border-amber-200 dark:border-amber-900/60 bg-amber-50/70 dark:bg-amber-950/25 p-3.5 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-amber-900 dark:text-amber-200 flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" aria-hidden="true" />
+                <span>Over-Capacity Dates Recorded ({overCapacityDates.length})</span>
+              </p>
+              <span className="text-[11px] text-amber-800 dark:text-amber-300">
+                Normal applications remain blocked until occupancy drops below cap.
+              </span>
+            </div>
+            <div className="max-h-44 overflow-y-auto divide-y divide-amber-200/70 dark:divide-amber-900/40 text-xs">
+              {overCapacityDates.map((item) => (
+                <div
+                  key={`${item.kind}_${item.date}`}
+                  className="py-2 flex flex-wrap items-center justify-between gap-2"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono font-semibold text-slate-900 dark:text-white">
+                      {formatDisplayDate(item.date)}
+                    </span>
+                    <span className="text-[11px] font-semibold text-amber-900 dark:text-amber-200">
+                      {item.kind === 'executive' ? 'Executive Cap' : 'Assistant / Attendant Cap'}
+                    </span>
+                    <span className="text-[11px] text-slate-600 dark:text-slate-300">
+                      {item.staffEntries
+                        .map((s) => `${s.staffId} (${s.status})`)
+                        .join(', ')}
+                    </span>
+                  </div>
+                  <span className="font-mono font-bold text-red-700 dark:text-red-400 tabular-nums">
+                    {item.occupiedCount}/{item.capLimit}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </section>
 
       {/* Leave Date Restrictions (Manager Only) */}

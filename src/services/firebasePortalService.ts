@@ -36,6 +36,11 @@ import {
   UserRole,
 } from '../types/portal';
 import { expandDateRange, getMonthMetadata } from '../utils/maldivesDate';
+import {
+  EXECUTIVE_LIMIT_REACHED_MESSAGE,
+  getExecutiveCapacityBreakdown,
+  isExecutiveDesignation,
+} from '../utils/leaveRules';
 import { findRestrictedDatesForStaff } from '../utils/leaveRestrictions';
 import { isValidPinFormat, isValidStaffIdFormat } from '../utils/staffAuthId';
 
@@ -59,6 +64,7 @@ const REMEMBERED_STAFF_ID_KEY = 'ssu_remembered_staff_id';
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   maxDailyCombinedCap: 10,
+  maxExecutiveDailyCap: 1,
   maxAnnualLeavePeriods: 3,
   pendingReservesCapacity: true,
   timezone: 'Asia/Male',
@@ -416,17 +422,24 @@ export function subscribeStaffProfile(
 
 export function subscribeSettings(
   onData: (settings: AppSettings) => void,
-  onError: (err: Error) => void
+  onError: (err: Error) => void,
+  onCapacitySyncState?: (needsSync: boolean) => void
 ): Unsubscribe {
   const path = 'appSettings/portalConfig';
   return onSnapshot(
     doc(db, 'appSettings', 'portalConfig'),
     (snap) => {
       if (!snap.exists()) {
+        onCapacitySyncState?.(true);
         onData(DEFAULT_APP_SETTINGS);
         return;
       }
-      onData({ ...DEFAULT_APP_SETTINGS, ...(snap.data() as Partial<AppSettings>) });
+      const raw = snap.data() as Record<string, unknown>;
+      const needsSync =
+        raw.pendingReservesCapacity !== true ||
+        typeof raw.maxExecutiveDailyCap !== 'number';
+      onCapacitySyncState?.(needsSync);
+      onData({ ...DEFAULT_APP_SETTINGS, ...(raw as Partial<AppSettings>) });
     },
     (error) => {
       try {
@@ -971,18 +984,24 @@ export async function requestLeaveModification(
       );
     }
 
-    // Verify daily capacity on newly added dates for cap-counting designations
-    if (staff.countsTowardDailyCap) {
-      const oldDates = new Set(req.dates || []);
-      const addedDates = exp.dates.filter((d) => !oldDates.has(d));
-      if (addedDates.length > 0) {
-        const [settingsSnap, fetched] = await Promise.all([
-          getDoc(doc(db, 'appSettings', 'portalConfig')),
-          fetchCapacityForDates(addedDates),
-        ]);
-        const maxCap = settingsSnap.exists()
-          ? Number(settingsSnap.data()?.maxDailyCombinedCap || 10)
-          : 10;
+    // Verify daily capacity on newly added dates for cap-counting designations and Executives
+    const oldDates = new Set(req.dates || []);
+    const addedDates = exp.dates.filter((d) => !oldDates.has(d));
+    const isExecApplicant = isExecutiveDesignation(staff.designation);
+
+    if (addedDates.length > 0 && (staff.countsTowardDailyCap || isExecApplicant)) {
+      const [settingsSnap, fetched] = await Promise.all([
+        getDoc(doc(db, 'appSettings', 'portalConfig')),
+        fetchCapacityForDates(addedDates),
+      ]);
+      const maxCap = settingsSnap.exists()
+        ? Number(settingsSnap.data()?.maxDailyCombinedCap || 10)
+        : 10;
+      const maxExecCap = settingsSnap.exists()
+        ? Math.max(1, Number(settingsSnap.data()?.maxExecutiveDailyCap || 1))
+        : 1;
+
+      if (staff.countsTowardDailyCap) {
         const fullDates: string[] = [];
         for (const dateKey of addedDates) {
           const cap = fetched.capacityMap[dateKey];
@@ -996,6 +1015,20 @@ export async function requestLeaveModification(
           throw new Error(
             `Daily capacity (${maxCap} slots including Pending & Approved) is full on: ${fullDates.join(', ')}.`
           );
+        }
+      }
+
+      if (isExecApplicant) {
+        for (const dateKey of addedDates) {
+          const execBreakdown = getExecutiveCapacityBreakdown({
+            dateKey,
+            capacityMap: fetched.capacityMap,
+            capacityDetailsMap: fetched.capacityDetailsMap,
+            defaultMaxExecCap: maxExecCap,
+          });
+          if (execBreakdown.isFull) {
+            throw new Error(EXECUTIVE_LIMIT_REACHED_MESSAGE);
+          }
         }
       }
     }
@@ -1241,10 +1274,12 @@ export async function updatePortalSettings(
   actor: StaffProfile,
   next: {
     maxDailyCombinedCap: number;
+    maxExecutiveDailyCap: number;
     maxAnnualLeavePeriods: number;
   }
 ): Promise<void> {
   const cap = Math.min(10, Math.max(1, Number(next.maxDailyCombinedCap) || 10));
+  const execCap = Math.min(1, Math.max(1, Number(next.maxExecutiveDailyCap) || 1));
   const annual = Math.min(10, Math.max(1, Number(next.maxAnnualLeavePeriods) || 3));
   const logId = makeClientId('log');
   const batch = writeBatch(db);
@@ -1252,6 +1287,7 @@ export async function updatePortalSettings(
   batch.set(doc(db, 'appSettings', 'portalConfig'), {
     ...DEFAULT_APP_SETTINGS,
     maxDailyCombinedCap: cap,
+    maxExecutiveDailyCap: execCap,
     maxAnnualLeavePeriods: annual,
     updatedByStaffId: actor.staffId,
     updatedAt: serverTimestamp(),
@@ -1265,7 +1301,7 @@ export async function updatePortalSettings(
     actorStaffId: actor.staffId,
     actorName: actor.fullName,
     actorRole: actor.role,
-    summary: `Updated portal configuration: dailyCap=${cap}, annualLimit=${annual}.`,
+    summary: `Updated portal configuration: dailyCap=${cap}, executiveCap=${execCap}, annualLimit=${annual}.`,
     createdAt: serverTimestamp(),
   });
 
