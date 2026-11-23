@@ -46,6 +46,29 @@ let cachedGoogleJwks: {
   expiresAtMs: number;
 } | null = null;
 
+// Short-lived per-isolate read caches to prevent redundant Spark-tier collection scans
+const STAFF_INDEX_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const RESTRICTIONS_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+let cachedStaffIdIndex: {
+  projectId: string;
+  tokenToDocId: Map<string, string>;
+  expiresAtMs: number;
+} | null = null;
+let cachedLeaveRestrictions: {
+  projectId: string;
+  docs: FirestoreDocument[];
+  expiresAtMs: number;
+} | null = null;
+let cachedCapacityBackfillVerified = false;
+
+function invalidateStaffIdIndexCache(): void {
+  cachedStaffIdIndex = null;
+}
+
+function invalidateLeaveRestrictionsCache(): void {
+  cachedLeaveRestrictions = null;
+}
+
 function jsonResponse(
   data: unknown,
   status = 200,
@@ -840,6 +863,48 @@ async function fsCreateDoc(
   }
 }
 
+function buildStaffDocIdCandidates(trimmed: string): string[] {
+  const candidates: string[] = [];
+  const pushUnique = (val: string) => {
+    const clean = val.trim();
+    if (clean && clean !== trimmed && !candidates.includes(clean)) {
+      candidates.push(clean);
+    }
+  };
+
+  pushUnique(trimmed.toUpperCase());
+  const noHyphen = trimmed.replace(/-/g, '').toUpperCase();
+  pushUnique(noHyphen);
+
+  // Common SSU format: letter prefix followed by digits (e.g. a5530 -> A-5530)
+  const alphaNumMatch = /^([A-Za-z]+)(\d+)$/.exec(trimmed.replace(/-/g, ''));
+  if (alphaNumMatch) {
+    pushUnique(`${alphaNumMatch[1].toUpperCase()}-${alphaNumMatch[2]}`);
+  }
+  return candidates;
+}
+
+async function getCachedLeaveRestrictionDocs(
+  projectId: string,
+  accessToken: string
+): Promise<FirestoreDocument[]> {
+  const now = Date.now();
+  if (
+    cachedLeaveRestrictions &&
+    cachedLeaveRestrictions.projectId === projectId &&
+    cachedLeaveRestrictions.expiresAtMs > now
+  ) {
+    return cachedLeaveRestrictions.docs;
+  }
+  const docs = await fsListCollection(projectId, accessToken, 'leaveRestrictions');
+  cachedLeaveRestrictions = {
+    projectId,
+    docs,
+    expiresAtMs: now + RESTRICTIONS_CACHE_TTL_MS,
+  };
+  return docs;
+}
+
 async function findAuthorizedStaffDoc(
   projectId: string,
   accessToken: string,
@@ -848,6 +913,7 @@ async function findAuthorizedStaffDoc(
   const trimmed = rawStaffId.trim();
   if (!trimmed) return null;
 
+  // 1. Direct exact document lookup (1 read)
   const exact = await fsGetDoc(projectId, accessToken, `staff/${trimmed}`);
   if (exact) {
     const docId = fsDocId(exact.name) || trimmed;
@@ -858,19 +924,91 @@ async function findAuthorizedStaffDoc(
   const targetToken = normalizeStaffIdToken(trimmed);
   if (!targetToken) return null;
 
-  const allStaff = await fsListCollection(projectId, accessToken, 'staff');
-  for (const doc of allStaff) {
-    const docId = fsDocId(doc.name);
-    const fieldStaffId = fsStr(doc.fields, 'staffId');
-    const candidateId = fieldStaffId || docId;
-    if (
-      (fieldStaffId && normalizeStaffIdToken(fieldStaffId) === targetToken) ||
-      (docId && normalizeStaffIdToken(docId) === targetToken)
-    ) {
-      return { staffId: candidateId, docId: docId || candidateId, doc };
+  // 2. Direct lookup of normalized case/hyphen variants via a single batchGet (no collection scan)
+  const candidateIds = buildStaffDocIdCandidates(trimmed);
+  if (candidateIds.length > 0) {
+    const candidatePaths = candidateIds.map((id) => `staff/${id}`);
+    const batchMap = await fsBatchGetDocs(projectId, accessToken, candidatePaths);
+    for (const p of candidatePaths) {
+      const foundDoc = batchMap[p];
+      if (foundDoc) {
+        const docId = fsDocId(foundDoc.name) || p.slice('staff/'.length);
+        const id = fsStr(foundDoc.fields, 'staffId') || docId;
+        return { staffId: id, docId, doc: foundDoc };
+      }
     }
   }
-  return null;
+
+  // 3. Direct lookup via deterministic auth link (ss_<normalizedToken>) -> direct staff doc read
+  const linkDoc = await fsGetDoc(
+    projectId,
+    accessToken,
+    `staffAuthLinks/${deterministicStaffUid(trimmed)}`
+  );
+  const linkedStaffId = fsStr(linkDoc?.fields, 'staffId').trim();
+  if (linkedStaffId && linkedStaffId !== trimmed && !candidateIds.includes(linkedStaffId)) {
+    const linkedDoc = await fsGetDoc(projectId, accessToken, `staff/${linkedStaffId}`);
+    if (linkedDoc) {
+      const docId = fsDocId(linkedDoc.name) || linkedStaffId;
+      const id = fsStr(linkedDoc.fields, 'staffId') || docId;
+      return { staffId: id, docId, doc: linkedDoc };
+    }
+  }
+
+  // 4. Last-resort cached Staff ID index (prevents repeated full collection scans on mistyped/unknown IDs)
+  const now = Date.now();
+  let tokenMap: Map<string, string>;
+  if (
+    cachedStaffIdIndex &&
+    cachedStaffIdIndex.projectId === projectId &&
+    cachedStaffIdIndex.expiresAtMs > now
+  ) {
+    tokenMap = cachedStaffIdIndex.tokenToDocId;
+  } else {
+    const allStaff = await fsListCollection(projectId, accessToken, 'staff');
+    tokenMap = new Map<string, string>();
+    for (const doc of allStaff) {
+      const docId = fsDocId(doc.name);
+      const fieldStaffId = fsStr(doc.fields, 'staffId');
+      const resolvedDocId = docId || fieldStaffId;
+      if (!resolvedDocId) continue;
+      if (fieldStaffId) {
+        const t = normalizeStaffIdToken(fieldStaffId);
+        if (t && !tokenMap.has(t)) tokenMap.set(t, resolvedDocId);
+      }
+      if (docId) {
+        const t = normalizeStaffIdToken(docId);
+        if (t && !tokenMap.has(t)) tokenMap.set(t, resolvedDocId);
+      }
+      if (
+        (fieldStaffId && normalizeStaffIdToken(fieldStaffId) === targetToken) ||
+        (docId && normalizeStaffIdToken(docId) === targetToken)
+      ) {
+        cachedStaffIdIndex = {
+          projectId,
+          tokenToDocId: tokenMap,
+          expiresAtMs: now + STAFF_INDEX_CACHE_TTL_MS,
+        };
+        const id = fieldStaffId || resolvedDocId;
+        return { staffId: id, docId: resolvedDocId, doc };
+      }
+    }
+    cachedStaffIdIndex = {
+      projectId,
+      tokenToDocId: tokenMap,
+      expiresAtMs: now + STAFF_INDEX_CACHE_TTL_MS,
+    };
+    return null;
+  }
+
+  const cachedDocId = tokenMap.get(targetToken);
+  if (!cachedDocId) return null;
+
+  const fallbackDoc = await fsGetDoc(projectId, accessToken, `staff/${cachedDocId}`);
+  if (!fallbackDoc) return null;
+  const docId = fsDocId(fallbackDoc.name) || cachedDocId;
+  const id = fsStr(fallbackDoc.fields, 'staffId') || docId;
+  return { staffId: id, docId, doc: fallbackDoc };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1515,12 +1653,16 @@ async function reconcilePendingCapacity(
   force = false
 ): Promise<{ syncedDates: number; activeRequests: number }> {
   if (!force) {
+    if (cachedCapacityBackfillVerified) {
+      return { syncedDates: 0, activeRequests: 0 };
+    }
     const settingsDoc = await fsGetDoc(projectId, accessToken, 'appSettings/portalConfig');
     if (
       settingsDoc?.fields &&
       fsBool(settingsDoc.fields, 'pendingReservesCapacity', false) &&
       settingsDoc.fields.maxExecutiveDailyCap
     ) {
+      cachedCapacityBackfillVerified = true;
       return { syncedDates: 0, activeRequests: 0 };
     }
   }
@@ -1764,6 +1906,21 @@ class LoginStageError extends Error {
   }
 }
 
+function isFirestoreQuotaError(err: unknown): boolean {
+  if (err instanceof FirestoreRestError) {
+    return (
+      err.httpStatus === 429 ||
+      Boolean(err.googleStatus && err.googleStatus.toUpperCase().includes('RESOURCE_EXHAUSTED')) ||
+      /quota\s+exceeded/i.test(err.safeMessage)
+    );
+  }
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return /429|RESOURCE_EXHAUSTED|quota\s+exceeded/i.test(msg);
+}
+
+const FIRESTORE_QUOTA_USER_MESSAGE =
+  'Service temporarily unavailable: the database has reached its daily Firebase Firestore free-tier quota limit. All staff accounts and leave records remain safe; please try again after the daily quota resets.';
+
 function summarizeSafeLoginError(
   stage: LoginStage,
   err: unknown,
@@ -1800,6 +1957,10 @@ function summarizeSafeLoginError(
       saProjectId && saProjectId !== projectId
         ? ` (Service account project "${saProjectId}" differs from configured project "${projectId}".)`
         : '';
+
+    if (isFirestoreQuotaError(err)) {
+      return FIRESTORE_QUOTA_USER_MESSAGE;
+    }
 
     if (err instanceof FirestoreRestError) {
       const codeStr = err.googleStatus || (err.googleCode ? String(err.googleCode) : '');
@@ -1885,7 +2046,8 @@ async function runLoginStage<T>(
       context.projectId,
       context.saProjectId
     );
-    throw new LoginStageError(stage, publicMessage, errMessage, 500, {
+    const httpResponseStatus = isFirestoreQuotaError(err) ? 503 : 500;
+    throw new LoginStageError(stage, publicMessage, errMessage, httpResponseStatus, {
       firestoreHttpStatus: firestoreDetails.firestoreHttpStatus,
       firestoreCode: firestoreDetails.firestoreCode,
       firestoreOperation: firestoreDetails.firestoreOperation,
@@ -1997,28 +2159,53 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
     );
   }
 
-  // 2. Read server-only hashed PIN credential from staffPinSecrets/{staffId} (with docId fallback)
-  let secretDocId = staffId;
+  // 2. Read server-only hashed PIN credential & existing auth link in a single batchGet
+  const tentativeCandidateUid = fsStr(staffFields, 'authUid').trim();
+  const tentativeUid =
+    tentativeCandidateUid && /^[a-zA-Z0-9_-]{1,128}$/.test(tentativeCandidateUid)
+      ? tentativeCandidateUid
+      : deterministicStaffUid(staffId);
+
   const secretStep = await runFirestoreWithTokenRetry(
     sa,
     activeAccessToken,
     'lookup_pin_secret',
     { projectId, saProjectId: sa.project_id, staffId },
-    async (token) => {
-      const primary = await fsGetDoc(projectId, token, `staffPinSecrets/${staffId}`);
-      if (primary) return primary;
+    async (token): Promise<{
+      secretDoc: FirestoreDocument | null;
+      secretDocId: string;
+      prefetchedLinkDoc: FirestoreDocument | null;
+    }> => {
+      const secretPaths = [`staffPinSecrets/${staffId}`];
       if (staffDocId && staffDocId !== staffId) {
-        const fallback = await fsGetDoc(projectId, token, `staffPinSecrets/${staffDocId}`);
-        if (fallback) {
-          secretDocId = staffDocId;
-          return fallback;
-        }
+        secretPaths.push(`staffPinSecrets/${staffDocId}`);
       }
-      return null;
+      const linkPath = `staffAuthLinks/${tentativeUid}`;
+      const batchMap = await fsBatchGetDocs(projectId, token, [...secretPaths, linkPath]);
+      const prefetchedLinkDoc = batchMap[linkPath] || null;
+      if (batchMap[secretPaths[0]]) {
+        return {
+          secretDoc: batchMap[secretPaths[0]],
+          secretDocId: staffId,
+          prefetchedLinkDoc,
+        };
+      }
+      if (secretPaths[1] && batchMap[secretPaths[1]]) {
+        return {
+          secretDoc: batchMap[secretPaths[1]],
+          secretDocId: staffDocId,
+          prefetchedLinkDoc,
+        };
+      }
+      return {
+        secretDoc: null,
+        secretDocId: staffId,
+        prefetchedLinkDoc,
+      };
     }
   );
   activeAccessToken = secretStep.token;
-  const secretDoc = secretStep.result;
+  const { secretDoc, secretDocId, prefetchedLinkDoc } = secretStep.result;
   if (!secretDoc || !secretDoc.fields) {
     console.warn(`[auth/login] Missing staffPinSecrets/${staffId}; administrator must run initial PIN provisioning.`);
     return jsonResponse({ error: 'Invalid Staff ID or PIN.' }, 401);
@@ -2104,7 +2291,7 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
     activeAccessToken = resetAttemptsStep.token;
   }
 
-  // 4. Sync non-destructive auth link fields (preserve all existing staff profile data)
+  // 4. Sync auth link / staff profile ONLY when missing or out of sync (0 writes on steady-state login)
   const candidateUid =
     fsStr(staffFields, 'authUid').trim() ||
     fsStr(secretFields, 'authUid').trim();
@@ -2115,22 +2302,33 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
   const role = fsStr(staffFields, 'role') || 'staff';
   const designation = fsStr(staffFields, 'designation') || 'ASSISTANT OFFICER';
 
-  const authLinkStep = await runFirestoreWithTokenRetry(
-    sa,
-    activeAccessToken,
-    'sync_auth_link',
-    { projectId, saProjectId: sa.project_id, staffId },
-    (token) =>
-      fsPatchDoc(projectId, token, `staffAuthLinks/${uid}`, {
-        uid: { stringValue: uid },
-        staffId: { stringValue: staffId },
-        role: { stringValue: role },
-        designation: { stringValue: designation },
-        isActive: { booleanValue: true },
-        updatedAt: { timestampValue: nowIso },
-      })
-  );
-  activeAccessToken = authLinkStep.token;
+  const existingLinkForUid = uid === tentativeUid ? prefetchedLinkDoc : null;
+  const linkNeedsSync =
+    !existingLinkForUid?.fields ||
+    fsStr(existingLinkForUid.fields, 'uid') !== uid ||
+    fsStr(existingLinkForUid.fields, 'staffId') !== staffId ||
+    fsStr(existingLinkForUid.fields, 'role') !== role ||
+    fsStr(existingLinkForUid.fields, 'designation') !== designation ||
+    !fsBool(existingLinkForUid.fields, 'isActive', false);
+
+  if (linkNeedsSync) {
+    const authLinkStep = await runFirestoreWithTokenRetry(
+      sa,
+      activeAccessToken,
+      'sync_auth_link',
+      { projectId, saProjectId: sa.project_id, staffId },
+      (token) =>
+        fsPatchDoc(projectId, token, `staffAuthLinks/${uid}`, {
+          uid: { stringValue: uid },
+          staffId: { stringValue: staffId },
+          role: { stringValue: role },
+          designation: { stringValue: designation },
+          isActive: { booleanValue: true },
+          updatedAt: { timestampValue: nowIso },
+        })
+    );
+    activeAccessToken = authLinkStep.token;
+  }
 
   if (
     fsStr(staffFields, 'authUid') !== uid ||
@@ -2611,6 +2809,8 @@ async function handleAddStaff(request: Request, env: WorkerEnv): Promise<Respons
     createdAt: { timestampValue: nowIso },
   });
 
+  invalidateStaffIdIndexCache();
+
   return jsonResponse({
     ok: true,
     staffId,
@@ -2636,7 +2836,6 @@ async function handleSyncPendingCapacity(request: Request, env: WorkerEnv): Prom
 
 async function handleSubmitLeave(request: Request, env: WorkerEnv): Promise<Response> {
   const caller = await authenticateActiveCaller(request, env);
-  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
 
   let body: {
     leaveType?: unknown;
@@ -2676,10 +2875,9 @@ async function handleSubmitLeave(request: Request, env: WorkerEnv): Promise<Resp
   const requestId = makeServerId('req');
   const logId = makeServerId('log');
 
-  const restrictionDocs = await fsListCollection(
+  const restrictionDocs = await getCachedLeaveRestrictionDocs(
     caller.projectId,
-    caller.accessToken,
-    'leaveRestrictions'
+    caller.accessToken
   );
   const parsedRestrictions = restrictionDocs.map(parseLeaveRestrictionDoc);
   const blockedCheck = findBlockedDatesWorker(
@@ -2898,7 +3096,6 @@ async function handleSubmitLeave(request: Request, env: WorkerEnv): Promise<Resp
 
 async function handleCancelPendingLeave(request: Request, env: WorkerEnv): Promise<Response> {
   const caller = await authenticateActiveCaller(request, env);
-  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
 
   let body: { requestId?: unknown };
   try {
@@ -3029,7 +3226,6 @@ async function handleCancelPendingLeave(request: Request, env: WorkerEnv): Promi
 
 async function handleEditPendingLeave(request: Request, env: WorkerEnv): Promise<Response> {
   const caller = await authenticateActiveCaller(request, env);
-  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
 
   let body: {
     requestId?: unknown;
@@ -3063,10 +3259,9 @@ async function handleEditPendingLeave(request: Request, env: WorkerEnv): Promise
   const logId = makeServerId('log');
 
   // Verify active leave restrictions against all selected dates before touching slots
-  const restrictionDocs = await fsListCollection(
+  const restrictionDocs = await getCachedLeaveRestrictionDocs(
     caller.projectId,
-    caller.accessToken,
-    'leaveRestrictions'
+    caller.accessToken
   );
   const parsedRestrictions = restrictionDocs.map(parseLeaveRestrictionDoc);
   const blockedCheck = findBlockedDatesWorker(
@@ -3350,7 +3545,6 @@ async function handleApproveLeave(request: Request, env: WorkerEnv): Promise<Res
   if (caller.role !== 'executive' && caller.role !== 'manager') {
     throw new HttpApiError(403, 'Only Executives and Managers can approve leave requests.');
   }
-  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
 
   let body: { requestId?: unknown; comment?: unknown };
   try {
@@ -3520,7 +3714,6 @@ async function handleRejectLeave(request: Request, env: WorkerEnv): Promise<Resp
   if (caller.role !== 'executive' && caller.role !== 'manager') {
     throw new HttpApiError(403, 'Only Executives and Managers can reject leave requests.');
   }
-  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
 
   let body: { requestId?: unknown; comment?: unknown };
   try {
@@ -3660,7 +3853,6 @@ async function handleProcessModification(request: Request, env: WorkerEnv): Prom
   if (caller.role !== 'executive' && caller.role !== 'manager') {
     throw new HttpApiError(403, 'Only Executives and Managers can process leave modifications.');
   }
-  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
 
   let body: { requestId?: unknown; decision?: unknown; comment?: unknown };
   try {
@@ -3769,10 +3961,9 @@ async function handleProcessModification(request: Request, env: WorkerEnv): Prom
       }
       newDates = expanded.dates;
 
-      const restrictionDocs = await fsListCollection(
+      const restrictionDocs = await getCachedLeaveRestrictionDocs(
         caller.projectId,
-        caller.accessToken,
-        'leaveRestrictions'
+        caller.accessToken
       );
       const blockedCheck = findBlockedDatesWorker(
         newDates,
@@ -4043,7 +4234,6 @@ async function handleRemoveApprovedLeave(request: Request, env: WorkerEnv): Prom
   if (caller.role !== 'executive' && caller.role !== 'manager') {
     throw new HttpApiError(403, 'Only Executives and Managers can remove approved leave.');
   }
-  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
 
   let body: { requestId?: unknown };
   try {
@@ -4187,7 +4377,6 @@ async function handleManagerAddLeave(request: Request, env: WorkerEnv): Promise<
   if (caller.role !== 'manager') {
     throw new HttpApiError(403, 'Only Managers can add leave directly.');
   }
-  await reconcilePendingCapacity(caller.projectId, caller.accessToken, false);
 
   let body: {
     staffId?: unknown;
@@ -4616,12 +4805,14 @@ async function handleRemoveStaff(request: Request, env: WorkerEnv): Promise<Resp
     }
   );
 
+  invalidateStaffIdIndexCache();
+
   return jsonResponse({ ok: true, removedRequests });
 }
 
 async function handleListRestrictions(request: Request, env: WorkerEnv): Promise<Response> {
   const caller = await authenticateActiveCaller(request, env);
-  const docs = await fsListCollection(caller.projectId, caller.accessToken, 'leaveRestrictions');
+  const docs = await getCachedLeaveRestrictionDocs(caller.projectId, caller.accessToken);
   const items = docs
     .map(parseLeaveRestrictionDoc)
     .filter((r) => caller.role === 'manager' || r.isActive)
@@ -4788,6 +4979,8 @@ async function handleSaveRestriction(request: Request, env: WorkerEnv): Promise<
     ]
   );
 
+  invalidateLeaveRestrictionsCache();
+
   const logId = makeServerId('log');
   await fsCreateDoc(caller.projectId, caller.accessToken, 'auditLogs', logId, {
     logId: { stringValue: logId },
@@ -4880,6 +5073,8 @@ async function handleDeleteRestriction(request: Request, env: WorkerEnv): Promis
       currentDocument: { exists: false },
     },
   ]);
+
+  invalidateLeaveRestrictionsCache();
 
   return jsonResponse({ ok: true, restrictionId });
 }
@@ -5099,6 +5294,9 @@ export default {
             {
               error: err.publicMessage,
               stage: err.stage,
+              ...(isFirestoreQuotaError(err) || err.firestoreHttpStatus === 429
+                ? { code: 'RESOURCE_EXHAUSTED' }
+                : {}),
               ...(err.firestoreHttpStatus !== undefined
                 ? { firestoreHttpStatus: err.firestoreHttpStatus }
                 : {}),
@@ -5121,6 +5319,17 @@ export default {
             googleStatus: err.googleStatus ?? null,
             safeMessage: err.safeMessage,
           });
+          if (isFirestoreQuotaError(err)) {
+            return jsonResponse(
+              {
+                error: FIRESTORE_QUOTA_USER_MESSAGE,
+                code: 'RESOURCE_EXHAUSTED',
+                firestoreHttpStatus: 429,
+                firestoreCode: err.googleStatus || 'RESOURCE_EXHAUSTED',
+              },
+              503
+            );
+          }
           return jsonResponse(
             {
               error: `Firestore ${err.operation} error (${err.httpStatus}${err.googleStatus ? ` ${err.googleStatus}` : ''}): ${err.safeMessage}`,

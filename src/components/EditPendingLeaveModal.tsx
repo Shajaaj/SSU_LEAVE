@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, Calendar, CheckCircle2, X } from 'lucide-react';
 import {
   AppSettings,
@@ -11,9 +11,7 @@ import {
 import {
   RestrictedLeaveError,
   fetchCapacityForDates,
-  loadActiveRestrictionsStrict,
 } from '../services/firebasePortalService';
-import { findRestrictedDatesForStaff } from '../utils/leaveRestrictions';
 import {
   getDailyCapacityBreakdown,
   getExecutiveCapacityBreakdown,
@@ -37,7 +35,6 @@ interface EditPendingLeaveModalProps {
   pendingDemandMap: Record<string, number>;
   settings: AppSettings;
   restrictions?: LeaveRestriction[];
-  onRefreshRestrictions?: () => Promise<LeaveRestriction[]>;
   onSave: (
     req: LeaveRequest,
     payload: { startDate: string; endDate: string }
@@ -60,7 +57,6 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
   pendingDemandMap,
   settings,
   restrictions = [],
-  onRefreshRestrictions,
   onSave,
 }) => {
   const activeRecord = liveRequest || targetRequest;
@@ -78,6 +74,7 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
   const [extraDetailsMap, setExtraDetailsMap] = useState<
     Record<string, DailyCapacityDetail>
   >({});
+  const fetchedCapDatesRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     if (open && targetRequest) {
@@ -89,6 +86,7 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
       setRuntimeBlocked(null);
       setExtraCapMap({});
       setExtraDetailsMap({});
+      fetchedCapDatesRef.current.clear();
     }
   }, [open, targetRequest]);
 
@@ -103,23 +101,31 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
   useEffect(() => {
     if (!open || expandedPreviewDates.length === 0) return;
     const missing = expandedPreviewDates.filter(
-      (d) => !(d in capacityMap) && !(d in extraCapMap)
+      (d) => !(d in capacityMap) && !fetchedCapDatesRef.current.has(d)
     );
     if (missing.length === 0) return;
+
+    for (const d of missing) {
+      fetchedCapDatesRef.current.add(d);
+    }
 
     let cancelled = false;
     void fetchCapacityForDates(missing)
       .then((res) => {
         if (cancelled) return;
-        setExtraCapMap((prev) => ({ ...prev, ...res.capacityMap }));
-        setExtraDetailsMap((prev) => ({ ...prev, ...res.capacityDetailsMap }));
+        if (Object.keys(res.capacityMap).length > 0) {
+          setExtraCapMap((prev) => ({ ...prev, ...res.capacityMap }));
+        }
+        if (Object.keys(res.capacityDetailsMap).length > 0) {
+          setExtraDetailsMap((prev) => ({ ...prev, ...res.capacityDetailsMap }));
+        }
       })
       .catch(() => undefined);
 
     return () => {
       cancelled = true;
     };
-  }, [open, expandedPreviewDates, capacityMap, extraCapMap]);
+  }, [open, expandedPreviewDates, capacityMap]);
 
   const mergedCapacityMap = useMemo(
     () => ({ ...extraCapMap, ...capacityMap }),
@@ -260,24 +266,6 @@ export const EditPendingLeaveModal: React.FC<EditPendingLeaveModalProps> = ({
 
     setSaving(true);
     try {
-      const freshRestrictions = onRefreshRestrictions
-        ? await onRefreshRestrictions()
-        : await loadActiveRestrictionsStrict();
-      const freshCheck = findRestrictedDatesForStaff(
-        validation.dates,
-        freshRestrictions,
-        staff
-      );
-      if (freshCheck.matchedRestrictions.length > 0) {
-        setRuntimeBlocked(freshCheck);
-        setDismissedPopupSig(null);
-        const primary = freshCheck.matchedRestrictions[0];
-        setSaveError(
-          `You are not permitted to apply for leave during the selected dates. Reason: ${primary.reason}. Please select alternative dates.`
-        );
-        return;
-      }
-
       await onSave(targetRequest, {
         startDate: newStartDate,
         endDate: newEndDate,

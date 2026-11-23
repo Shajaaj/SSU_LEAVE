@@ -20,7 +20,14 @@ import {
   where,
   writeBatch,
 } from 'firebase/firestore';
-import { OperationType, auth, db, handleFirestoreError } from '../firebase/client';
+import {
+  FIRESTORE_QUOTA_USER_MESSAGE,
+  OperationType,
+  auth,
+  db,
+  handleFirestoreError,
+  isFirestoreQuotaError,
+} from '../firebase/client';
 import {
   AppSettings,
   AuditLog,
@@ -61,6 +68,57 @@ export class RestrictedLeaveError extends Error {
 }
 
 const REMEMBERED_STAFF_ID_KEY = 'ssu_remembered_staff_id';
+const PROFILE_CACHE_TTL_MS = 5_000;
+const RESTRICTIONS_CACHE_TTL_MS = 30_000;
+const CAPACITY_DATE_CACHE_TTL_MS = 45_000;
+
+const profileResolutionInFlight = new Map<string, Promise<StaffProfile>>();
+const profileResolutionCache = new Map<
+  string,
+  { profile: StaffProfile; expiresAt: number }
+>();
+
+let restrictionsCache: { items: LeaveRestriction[]; expiresAt: number } | null = null;
+let restrictionsInFlight: Promise<LeaveRestriction[]> | null = null;
+
+const capacityDateCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    cap: DailyCapacity | null;
+    detail: DailyCapacityDetail | null;
+  }
+>();
+
+export function primeClientRestrictionsCache(items: LeaveRestriction[]): void {
+  restrictionsCache = {
+    items,
+    expiresAt: Date.now() + RESTRICTIONS_CACHE_TTL_MS,
+  };
+}
+
+export function invalidateClientRestrictionsCache(): void {
+  restrictionsCache = null;
+  restrictionsInFlight = null;
+}
+
+export function invalidateCapacityCacheForDates(dates?: string[]): void {
+  if (!dates || dates.length === 0) {
+    capacityDateCache.clear();
+    return;
+  }
+  for (const d of dates) {
+    capacityDateCache.delete(d);
+  }
+}
+
+export function clearClientSessionCaches(): void {
+  profileResolutionInFlight.clear();
+  profileResolutionCache.clear();
+  restrictionsCache = null;
+  restrictionsInFlight = null;
+  capacityDateCache.clear();
+}
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   maxDailyCombinedCap: 10,
@@ -156,8 +214,15 @@ async function postWorkerJson<T>(
     );
   }
 
-  const data = (await response.json()) as T & { error?: string };
+  const data = (await response.json()) as T & { error?: string; code?: string };
   if (!response.ok) {
+    if (
+      response.status === 503 ||
+      data?.code === 'RESOURCE_EXHAUSTED' ||
+      isFirestoreQuotaError(data?.error)
+    ) {
+      throw new Error(data?.error || FIRESTORE_QUOTA_USER_MESSAGE);
+    }
     throw new Error(data?.error || `Request failed (${response.status}).`);
   }
   return data;
@@ -183,8 +248,15 @@ async function getWorkerJson<T>(path: string, bearerToken: string): Promise<T> {
     throw new Error('Worker endpoint (/api/*) is unavailable.');
   }
 
-  const data = (await response.json()) as T & { error?: string };
+  const data = (await response.json()) as T & { error?: string; code?: string };
   if (!response.ok) {
+    if (
+      response.status === 503 ||
+      data?.code === 'RESOURCE_EXHAUSTED' ||
+      isFirestoreQuotaError(data?.error)
+    ) {
+      throw new Error(data?.error || FIRESTORE_QUOTA_USER_MESSAGE);
+    }
     throw new Error(data?.error || `Request failed (${response.status}).`);
   }
   return data;
@@ -193,49 +265,72 @@ async function getWorkerJson<T>(path: string, bearerToken: string): Promise<T> {
 export async function resolveSignedInStaffProfile(
   uid: string
 ): Promise<StaffProfile> {
-  const linkPath = `staffAuthLinks/${uid}`;
-  let linkSnap;
-  try {
-    linkSnap = await getDoc(doc(db, 'staffAuthLinks', uid));
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, linkPath);
+  const now = Date.now();
+  const cached = profileResolutionCache.get(uid);
+  if (cached && cached.expiresAt > now) {
+    return cached.profile;
   }
 
-  if (!linkSnap.exists()) {
-    throw new Error(
-      'Your account is not linked to an active staff profile. Please contact an Administrator.'
+  const existingInFlight = profileResolutionInFlight.get(uid);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const loadPromise = (async (): Promise<StaffProfile> => {
+    const linkPath = `staffAuthLinks/${uid}`;
+    let linkSnap;
+    try {
+      linkSnap = await getDoc(doc(db, 'staffAuthLinks', uid));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.GET, linkPath);
+    }
+
+    if (!linkSnap.exists()) {
+      throw new Error(
+        'Your account is not linked to an active staff profile. Please contact an Administrator.'
+      );
+    }
+
+    const link = linkSnap.data() as StaffAuthLink;
+    if (!link.isActive) {
+      throw new Error(
+        `Account ${link.staffId} has been deactivated. Contact a Manager.`
+      );
+    }
+
+    const staffPath = `staff/${link.staffId}`;
+    let staffSnap;
+    try {
+      staffSnap = await getDoc(doc(db, 'staff', link.staffId));
+    } catch (err) {
+      handleFirestoreError(err, OperationType.GET, staffPath);
+    }
+
+    if (!staffSnap.exists()) {
+      throw new Error(`Staff record ${link.staffId} not found.`);
+    }
+
+    const profile = normalizeStaffProfile(
+      staffSnap.data() as Record<string, unknown>,
+      staffSnap.id
     );
-  }
+    if (!profile.isActive) {
+      throw new Error(
+        `Account ${profile.staffId} has been deactivated. Contact a Manager.`
+      );
+    }
 
-  const link = linkSnap.data() as StaffAuthLink;
-  if (!link.isActive) {
-    throw new Error(
-      `Account ${link.staffId} has been deactivated. Contact a Manager.`
-    );
-  }
+    profileResolutionCache.set(uid, {
+      profile,
+      expiresAt: Date.now() + PROFILE_CACHE_TTL_MS,
+    });
+    return profile;
+  })().finally(() => {
+    profileResolutionInFlight.delete(uid);
+  });
 
-  const staffPath = `staff/${link.staffId}`;
-  let staffSnap;
-  try {
-    staffSnap = await getDoc(doc(db, 'staff', link.staffId));
-  } catch (err) {
-    handleFirestoreError(err, OperationType.GET, staffPath);
-  }
-
-  if (!staffSnap.exists()) {
-    throw new Error(`Staff record ${link.staffId} not found.`);
-  }
-
-  const profile = normalizeStaffProfile(
-    staffSnap.data() as Record<string, unknown>,
-    staffSnap.id
-  );
-  if (!profile.isActive) {
-    throw new Error(
-      `Account ${profile.staffId} has been deactivated. Contact a Manager.`
-    );
-  }
-  return profile;
+  profileResolutionInFlight.set(uid, loadPromise);
+  return loadPromise;
 }
 
 export async function loginWithStaffId(
@@ -297,6 +392,7 @@ export async function loginWithStaffId(
 }
 
 export async function logoutSession(): Promise<void> {
+  clearClientSessionCaches();
   await signOut(auth);
 }
 
@@ -596,7 +692,7 @@ export function subscribeAuditLogs(
   const q = query(
     collection(db, 'auditLogs'),
     orderBy('createdAt', 'desc'),
-    limit(200)
+    limit(100)
   );
   return onSnapshot(
     q,
@@ -665,26 +761,56 @@ export async function fetchLeaveRestrictionsFromWorker(): Promise<LeaveRestricti
     .sort((a, b) => b.startDate.localeCompare(a.startDate));
 }
 
-export async function loadActiveRestrictionsStrict(): Promise<LeaveRestriction[]> {
-  // Prefer Worker endpoint first because it bypasses stale client cache & permission-rule delays
-  // and reads directly from Firestore using authenticated caller identity.
-  try {
-    return await fetchLeaveRestrictionsFromWorker();
-  } catch (workerErr) {
-    try {
-      const snap = await getDocsFromServer(collection(db, 'leaveRestrictions'));
-      return snap.docs
-        .map((d) => normalizeRestrictionRecord(d.data() as Record<string, unknown>, d.id))
-        .filter((r) => Boolean(r.startDate && r.endDate))
-        .sort((a, b) => b.startDate.localeCompare(a.startDate));
-    } catch {
-      throw new Error(
-        workerErr instanceof Error && workerErr.message
-          ? `Unable to verify leave date restrictions: ${workerErr.message}`
-          : 'Unable to load leave date restrictions. Please check your connection and try again.'
-      );
-    }
+export async function loadActiveRestrictionsStrict(
+  force = false
+): Promise<LeaveRestriction[]> {
+  if (!force && restrictionsCache && restrictionsCache.expiresAt > Date.now()) {
+    return restrictionsCache.items;
   }
+  if (!force && restrictionsInFlight) {
+    return restrictionsInFlight;
+  }
+
+  const fetchPromise = (async () => {
+    // Prefer Worker endpoint first because it bypasses stale client cache & permission-rule delays
+    // and reads from the Worker's short-lived isolate cache.
+    try {
+      const items = await fetchLeaveRestrictionsFromWorker();
+      primeClientRestrictionsCache(items);
+      return items;
+    } catch (workerErr) {
+      if (isFirestoreQuotaError(workerErr)) {
+        throw new Error(
+          workerErr instanceof Error && workerErr.message
+            ? workerErr.message
+            : FIRESTORE_QUOTA_USER_MESSAGE
+        );
+      }
+      try {
+        const snap = await getDocsFromServer(collection(db, 'leaveRestrictions'));
+        const items = snap.docs
+          .map((d) => normalizeRestrictionRecord(d.data() as Record<string, unknown>, d.id))
+          .filter((r) => Boolean(r.startDate && r.endDate))
+          .sort((a, b) => b.startDate.localeCompare(a.startDate));
+        primeClientRestrictionsCache(items);
+        return items;
+      } catch (fsErr) {
+        if (isFirestoreQuotaError(fsErr)) {
+          throw new Error(FIRESTORE_QUOTA_USER_MESSAGE);
+        }
+        throw new Error(
+          workerErr instanceof Error && workerErr.message
+            ? `Unable to verify leave date restrictions: ${workerErr.message}`
+            : 'Unable to load leave date restrictions. Please check your connection and try again.'
+        );
+      }
+    }
+  })().finally(() => {
+    restrictionsInFlight = null;
+  });
+
+  restrictionsInFlight = fetchPromise;
+  return fetchPromise;
 }
 
 export function subscribeLeaveRestrictions(
@@ -701,13 +827,21 @@ export function subscribeLeaveRestrictions(
         .map((d) => normalizeRestrictionRecord(d.data() as Record<string, unknown>, d.id))
         .filter((r) => Boolean(r.startDate && r.endDate))
         .sort((a, b) => b.startDate.localeCompare(a.startDate));
+      primeClientRestrictionsCache(items);
       onData(items);
     },
     (snapshotErr) => {
+      if (isFirestoreQuotaError(snapshotErr)) {
+        if (active) {
+          onError(new Error(FIRESTORE_QUOTA_USER_MESSAGE));
+        }
+        return;
+      }
       // Fallback via Cloudflare Worker when Firestore security rules are pending update
       void fetchLeaveRestrictionsFromWorker()
         .then((items) => {
           if (active) {
+            primeClientRestrictionsCache(items);
             onFallbackLoad?.();
             onData(items);
           }
@@ -715,11 +849,13 @@ export function subscribeLeaveRestrictions(
         .catch((workerErr) => {
           if (active) {
             onError(
-              workerErr instanceof Error
-                ? workerErr
-                : snapshotErr instanceof Error
-                  ? snapshotErr
-                  : new Error('Unable to load leave date restrictions.')
+              isFirestoreQuotaError(workerErr)
+                ? new Error(FIRESTORE_QUOTA_USER_MESSAGE)
+                : workerErr instanceof Error
+                  ? workerErr
+                  : snapshotErr instanceof Error
+                    ? snapshotErr
+                    : new Error('Unable to load leave date restrictions.')
             );
           }
         });
@@ -760,26 +896,47 @@ export async function fetchCapacityForDates(dates: string[]): Promise<{
     return { capacityMap: {}, capacityDetailsMap: {} };
   }
 
-  const [capSnaps, detailSnaps] = await Promise.all([
-    Promise.all(uniqueDates.map((d) => getDoc(doc(db, 'dailyCapacity', d)))),
-    Promise.all(uniqueDates.map((d) => getDoc(doc(db, 'dailyCapacityDetails', d)))),
-  ]);
-
+  const now = Date.now();
   const capacityMap: Record<string, DailyCapacity> = {};
   const capacityDetailsMap: Record<string, DailyCapacityDetail> = {};
+  const datesToFetch: string[] = [];
 
-  capSnaps.forEach((snap, idx) => {
-    if (snap.exists()) {
-      const data = snap.data() as DailyCapacity;
-      capacityMap[data.date || uniqueDates[idx]] = data;
+  for (const dateKey of uniqueDates) {
+    const cached = capacityDateCache.get(dateKey);
+    if (cached && cached.expiresAt > now) {
+      if (cached.cap) {
+        capacityMap[dateKey] = cached.cap;
+      }
+      if (cached.detail) {
+        capacityDetailsMap[dateKey] = cached.detail;
+      }
+    } else {
+      datesToFetch.push(dateKey);
     }
-  });
+  }
 
-  detailSnaps.forEach((snap, idx) => {
-    if (snap.exists()) {
-      const data = snap.data() as DailyCapacityDetail;
-      capacityDetailsMap[data.date || uniqueDates[idx]] = data;
+  if (datesToFetch.length === 0) {
+    return { capacityMap, capacityDetailsMap };
+  }
+
+  const [capSnaps, detailSnaps] = await Promise.all([
+    Promise.all(datesToFetch.map((d) => getDoc(doc(db, 'dailyCapacity', d)))),
+    Promise.all(datesToFetch.map((d) => getDoc(doc(db, 'dailyCapacityDetails', d)))),
+  ]);
+
+  const expiresAt = Date.now() + CAPACITY_DATE_CACHE_TTL_MS;
+  datesToFetch.forEach((dateKey, idx) => {
+    const capSnap = capSnaps[idx];
+    const detailSnap = detailSnaps[idx];
+    const cap = capSnap.exists() ? (capSnap.data() as DailyCapacity) : null;
+    const detail = detailSnap.exists() ? (detailSnap.data() as DailyCapacityDetail) : null;
+    if (cap) {
+      capacityMap[cap.date || dateKey] = cap;
     }
+    if (detail) {
+      capacityDetailsMap[detail.date || dateKey] = detail;
+    }
+    capacityDateCache.set(dateKey, { expiresAt, cap, detail });
   });
 
   return { capacityMap, capacityDetailsMap };
@@ -814,22 +971,6 @@ export async function submitLeaveRequest(
     throw new Error(expanded.error);
   }
 
-  // Always recheck active restrictions live from server before creating a leave request or reserving slots
-  const activeRestrictions = await loadActiveRestrictionsStrict();
-  const blockedCheck = findRestrictedDatesForStaff(
-    expanded.dates,
-    activeRestrictions,
-    staff
-  );
-  if (blockedCheck.matchedRestrictions.length > 0) {
-    const primary = blockedCheck.matchedRestrictions[0];
-    throw new RestrictedLeaveError(
-      `You are not permitted to apply for leave during the selected dates. Reason: ${primary.reason}. Please select alternative dates.`,
-      blockedCheck.blockedDates,
-      blockedCheck.matchedRestrictions
-    );
-  }
-
   const idToken = await user.getIdToken(true);
   const res = await postWorkerJson<{ ok: boolean; requestId: string }>(
     '/api/leave/submit',
@@ -842,6 +983,7 @@ export async function submitLeaveRequest(
     idToken
   );
 
+  invalidateCapacityCacheForDates(expanded.dates);
   return { requestId: res.requestId };
 }
 
@@ -859,6 +1001,7 @@ export async function cancelPendingLeaveRequest(
     { requestId: req.requestId },
     idToken
   );
+  invalidateCapacityCacheForDates(req.dates);
 }
 
 export async function editPendingLeaveDates(
@@ -888,21 +1031,6 @@ export async function editPendingLeaveDates(
     throw new Error(expanded.error);
   }
 
-  const activeRestrictions = await loadActiveRestrictionsStrict();
-  const blockedCheck = findRestrictedDatesForStaff(
-    expanded.dates,
-    activeRestrictions,
-    staff
-  );
-  if (blockedCheck.matchedRestrictions.length > 0) {
-    const primary = blockedCheck.matchedRestrictions[0];
-    throw new RestrictedLeaveError(
-      `You are not permitted to apply for leave during the selected dates. Reason: ${primary.reason}. Please select alternative dates.`,
-      blockedCheck.blockedDates,
-      blockedCheck.matchedRestrictions
-    );
-  }
-
   const idToken = await user.getIdToken(true);
   const res = await postWorkerJson<{
     ok: boolean;
@@ -920,6 +1048,7 @@ export async function editPendingLeaveDates(
     idToken
   );
 
+  invalidateCapacityCacheForDates([...(req.dates || []), ...expanded.dates]);
   return {
     startDate: res.startDate,
     endDate: res.endDate,
@@ -935,6 +1064,11 @@ export async function requestLeaveModification(
     note: string;
     requestedStartDate?: string;
     requestedEndDate?: string;
+  },
+  options?: {
+    existingUserRequests?: LeaveRequest[];
+    cachedRestrictions?: LeaveRestriction[];
+    settings?: AppSettings;
   }
 ): Promise<void> {
   if (payload.note.trim().length < 3) {
@@ -948,13 +1082,19 @@ export async function requestLeaveModification(
     );
     if (exp.error) throw new Error(exp.error);
 
-    // Prevent overlapping another pending or approved leave period
-    const userReqsSnap = await getDocs(
-      query(collection(db, 'leaveRequests'), where('staffId', '==', staff.staffId))
-    );
+    // Prevent overlapping another pending or approved leave period (reuse live requests when provided)
+    let userRequestsList: LeaveRequest[];
+    if (options?.existingUserRequests) {
+      userRequestsList = options.existingUserRequests;
+    } else {
+      const userReqsSnap = await getDocs(
+        query(collection(db, 'leaveRequests'), where('staffId', '==', staff.staffId))
+      );
+      userRequestsList = userReqsSnap.docs.map((d) => d.data() as LeaveRequest);
+    }
+
     const otherBooked = new Set<string>();
-    for (const d of userReqsSnap.docs) {
-      const item = d.data() as LeaveRequest;
+    for (const item of userRequestsList) {
       if (
         item.requestId !== req.requestId &&
         (item.status === 'pending' || item.status === 'approved')
@@ -969,7 +1109,10 @@ export async function requestLeaveModification(
       );
     }
 
-    const activeRestrictions = await loadActiveRestrictionsStrict();
+    const activeRestrictions =
+      options?.cachedRestrictions !== undefined
+        ? options.cachedRestrictions
+        : await loadActiveRestrictionsStrict(false);
     const blockedCheck = findRestrictedDatesForStaff(
       exp.dates,
       activeRestrictions,
@@ -990,16 +1133,26 @@ export async function requestLeaveModification(
     const isExecApplicant = isExecutiveDesignation(staff.designation);
 
     if (addedDates.length > 0 && (staff.countsTowardDailyCap || isExecApplicant)) {
-      const [settingsSnap, fetched] = await Promise.all([
-        getDoc(doc(db, 'appSettings', 'portalConfig')),
-        fetchCapacityForDates(addedDates),
-      ]);
-      const maxCap = settingsSnap.exists()
-        ? Number(settingsSnap.data()?.maxDailyCombinedCap || 10)
-        : 10;
-      const maxExecCap = settingsSnap.exists()
-        ? Math.max(1, Number(settingsSnap.data()?.maxExecutiveDailyCap || 1))
-        : 1;
+      let maxCap: number;
+      let maxExecCap: number;
+      let fetched;
+      if (options?.settings) {
+        maxCap = Number(options.settings.maxDailyCombinedCap || 10);
+        maxExecCap = Math.max(1, Number(options.settings.maxExecutiveDailyCap || 1));
+        fetched = await fetchCapacityForDates(addedDates);
+      } else {
+        const [settingsSnap, fetchedCap] = await Promise.all([
+          getDoc(doc(db, 'appSettings', 'portalConfig')),
+          fetchCapacityForDates(addedDates),
+        ]);
+        maxCap = settingsSnap.exists()
+          ? Number(settingsSnap.data()?.maxDailyCombinedCap || 10)
+          : 10;
+        maxExecCap = settingsSnap.exists()
+          ? Math.max(1, Number(settingsSnap.data()?.maxExecutiveDailyCap || 1))
+          : 1;
+        fetched = fetchedCap;
+      }
 
       if (staff.countsTowardDailyCap) {
         const fullDates: string[] = [];
@@ -1088,6 +1241,7 @@ export async function approveLeaveRequest(
     },
     idToken
   );
+  invalidateCapacityCacheForDates();
 }
 
 export async function rejectLeaveRequest(
@@ -1108,6 +1262,7 @@ export async function rejectLeaveRequest(
     },
     idToken
   );
+  invalidateCapacityCacheForDates();
 }
 
 export async function processLeaveModification(
@@ -1131,6 +1286,7 @@ export async function processLeaveModification(
     },
     idToken
   );
+  invalidateCapacityCacheForDates();
 }
 
 export async function removeApprovedLeaveRequest(requestId: string): Promise<void> {
@@ -1144,6 +1300,7 @@ export async function removeApprovedLeaveRequest(requestId: string): Promise<voi
     { requestId },
     idToken
   );
+  invalidateCapacityCacheForDates();
 }
 
 export async function managerAddApprovedLeave(payload: {
@@ -1184,6 +1341,7 @@ export async function managerAddApprovedLeave(payload: {
     },
     idToken
   );
+  invalidateCapacityCacheForDates(expanded.dates);
   return {
     requestId: res.requestId,
     peakOccupied: Number(res.peakOccupied || 0),
@@ -1331,6 +1489,7 @@ export async function saveLeaveRestriction(payload: {
     payload,
     idToken
   );
+  invalidateClientRestrictionsCache();
   return res.restriction;
 }
 
@@ -1345,6 +1504,7 @@ export async function deleteLeaveRestriction(restrictionId: string): Promise<voi
     { restrictionId },
     idToken
   );
+  invalidateClientRestrictionsCache();
 }
 
 export async function clearAllLeaveRecords(confirmation: string): Promise<{
@@ -1370,6 +1530,7 @@ export async function clearAllLeaveRecords(confirmation: string): Promise<{
     { confirmation: confirmation.trim() },
     idToken
   );
+  invalidateCapacityCacheForDates();
   return {
     deletedRequests: Number(res.deletedRequests || 0),
     deletedCapacityDocs: Number(res.deletedCapacityDocs || 0),

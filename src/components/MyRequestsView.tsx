@@ -30,7 +30,6 @@ interface MyRequestsViewProps {
   settings?: AppSettings;
   loading: boolean;
   onOpenNewRequest: () => void;
-  onRefreshRestrictions?: () => Promise<LeaveRestriction[]>;
   onEditPending: (
     req: LeaveRequest,
     payload: { startDate: string; endDate: string }
@@ -65,7 +64,6 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
   },
   loading,
   onOpenNewRequest,
-  onRefreshRestrictions,
   onEditPending,
   onCancelPending,
   onRequestModification,
@@ -292,9 +290,6 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
                         disabled={busyId === req.requestId}
                         onClick={() => {
                           setEditTarget(req);
-                          if (onRefreshRestrictions) {
-                            void onRefreshRestrictions().catch(() => undefined);
-                          }
                         }}
                         className="flex-1 sm:flex-initial min-h-[44px] sm:min-h-0 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-center gap-1.5 whitespace-nowrap"
                       >
@@ -470,7 +465,6 @@ export const MyRequestsView: React.FC<MyRequestsViewProps> = ({
         pendingDemandMap={pendingDemandMap}
         settings={settings}
         restrictions={restrictions}
-        onRefreshRestrictions={onRefreshRestrictions}
         onSave={onEditPending}
       />
 

@@ -53,6 +53,29 @@ export interface FirestoreErrorInfo {
   };
 }
 
+export const FIRESTORE_QUOTA_USER_MESSAGE =
+  'Service temporarily unavailable: daily Firestore quota limit reached. All accounts and leave records remain safe; please try again after the daily quota resets.';
+
+export function isFirestoreQuotaError(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === 'object') {
+    const obj = error as { code?: unknown; status?: unknown; message?: unknown };
+    if (obj.code === 'resource-exhausted' || obj.code === 'RESOURCE_EXHAUSTED') {
+      return true;
+    }
+    if (obj.status === 429 || obj.status === 503) {
+      return true;
+    }
+    if (typeof obj.message === 'string' && isFirestoreQuotaError(obj.message)) {
+      return true;
+    }
+  }
+  const msg = error instanceof Error ? error.message : String(error);
+  return /RESOURCE_EXHAUSTED|resource-exhausted|quota\s+exceeded|daily\s+Firebase\s+Firestore\s+free-tier\s+quota|daily\s+Firestore\s+quota/i.test(
+    msg
+  );
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
@@ -76,12 +99,34 @@ export function handleFirestoreError(
     path,
   };
   console.error('Firestore Error: ', JSON.stringify(errInfo));
+  if (isFirestoreQuotaError(error)) {
+    throw new Error(FIRESTORE_QUOTA_USER_MESSAGE);
+  }
   throw new Error(JSON.stringify(errInfo));
 }
 
+const CONNECTION_CHECK_KEY = 'ssu_fs_conn_checked';
+
 export async function testFirestoreConnection(): Promise<void> {
+  if (typeof window !== 'undefined') {
+    try {
+      if (window.sessionStorage.getItem(CONNECTION_CHECK_KEY) === '1') {
+        return;
+      }
+    } catch {
+      // Ignore storage access errors
+    }
+  }
+
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
+    if (typeof window !== 'undefined') {
+      try {
+        window.sessionStorage.setItem(CONNECTION_CHECK_KEY, '1');
+      } catch {
+        // Ignore storage access errors
+      }
+    }
   } catch (error) {
     if (
       error instanceof Error &&

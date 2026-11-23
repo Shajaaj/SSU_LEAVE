@@ -76,6 +76,7 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
   >({});
 
   const dropdownContainerRef = useRef<HTMLDivElement | null>(null);
+  const fetchedCapDatesRef = useRef<Set<string>>(new Set());
 
   const activeStaff = useMemo(
     () =>
@@ -114,6 +115,7 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
       setSubmitError(null);
       setExtraCapMap({});
       setExtraDetailsMap({});
+      fetchedCapDatesRef.current.clear();
     }
   }, [open, today]);
 
@@ -146,23 +148,31 @@ export const ManagerAddLeaveModal: React.FC<ManagerAddLeaveModalProps> = ({
   useEffect(() => {
     if (!open || expandedRange.dates.length === 0) return;
     const missing = expandedRange.dates.filter(
-      (d) => !(d in capacityMap) && !(d in extraCapMap)
+      (d) => !(d in capacityMap) && !fetchedCapDatesRef.current.has(d)
     );
     if (missing.length === 0) return;
+
+    for (const d of missing) {
+      fetchedCapDatesRef.current.add(d);
+    }
 
     let cancelled = false;
     void fetchCapacityForDates(missing)
       .then((res) => {
         if (cancelled) return;
-        setExtraCapMap((prev) => ({ ...prev, ...res.capacityMap }));
-        setExtraDetailsMap((prev) => ({ ...prev, ...res.capacityDetailsMap }));
+        if (Object.keys(res.capacityMap).length > 0) {
+          setExtraCapMap((prev) => ({ ...prev, ...res.capacityMap }));
+        }
+        if (Object.keys(res.capacityDetailsMap).length > 0) {
+          setExtraDetailsMap((prev) => ({ ...prev, ...res.capacityDetailsMap }));
+        }
       })
       .catch(() => undefined);
 
     return () => {
       cancelled = true;
     };
-  }, [open, expandedRange.dates, capacityMap, extraCapMap]);
+  }, [open, expandedRange.dates, capacityMap]);
 
   const mergedCapacityMap = useMemo(
     () => ({ ...extraCapMap, ...capacityMap }),

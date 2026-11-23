@@ -22,7 +22,11 @@ import {
 import { MyRequestsView } from './components/MyRequestsView';
 import { PortalShell } from './components/PortalShell';
 import { StaffDashboard } from './components/StaffDashboard';
-import { auth } from './firebase/client';
+import {
+  FIRESTORE_QUOTA_USER_MESSAGE,
+  auth,
+  isFirestoreQuotaError,
+} from './firebase/client';
 import {
   DEFAULT_APP_SETTINGS,
   addStaffByManager,
@@ -156,6 +160,22 @@ export default function App() {
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+  const lastQuotaToastAtRef = useRef(0);
+  const reportSyncError = useCallback(
+    (title: string, err: Error) => {
+      if (isFirestoreQuotaError(err)) {
+        const now = Date.now();
+        if (now - lastQuotaToastAtRef.current < 15_000) {
+          return;
+        }
+        lastQuotaToastAtRef.current = now;
+        addToast('error', 'Firestore Quota Limit Reached', FIRESTORE_QUOTA_USER_MESSAGE);
+        return;
+      }
+      addToast('error', title, err.message);
+    },
+    [addToast]
+  );
 
   const clearSignedInState = useCallback(() => {
     setLiveProfile(null);
@@ -211,30 +231,17 @@ export default function App() {
   const activeStaffId = liveProfile?.staffId || null;
   const activeRole = liveProfile?.role || null;
 
-  // Real-time Firestore listeners scoped by role
+  // Real-time Firestore listeners scoped by role (no duplicate staff/leaveRequests listeners)
   useEffect(() => {
     if (!activeStaffId || !activeRole) return;
 
     setLoadingRequests(true);
     const onSubError = (err: Error) => {
-      addToast('error', 'Firestore Sync Error', err.message);
+      reportSyncError('Firestore Sync Error', err);
       setLoadingRequests(false);
     };
 
     const unsubscribers = [
-      subscribeStaffProfile(
-        activeStaffId,
-        (updated) => {
-          if (!updated || !updated.isActive) {
-            void logoutSession().catch(() => undefined);
-            clearSignedInState();
-            setAuthErrorBanner('Your staff account is inactive or unavailable.');
-            return;
-          }
-          setLiveProfile(updated);
-        },
-        onSubError
-      ),
       subscribeSettings(
         (nextSettings) => {
           setLiveSettings(nextSettings);
@@ -242,14 +249,6 @@ export default function App() {
         },
         onSubError,
         setNeedsCapacitySync
-      ),
-      subscribeMyRequests(
-        activeStaffId,
-        (items) => {
-          setLiveMyRequests(items);
-          setLoadingRequests(false);
-        },
-        onSubError
       ),
       subscribeLeaveRestrictions(
         (items) => {
@@ -268,18 +267,43 @@ export default function App() {
     ];
 
     if (activeRole === 'executive' || activeRole === 'manager') {
+      setLiveMyRequests([]);
       unsubscribers.push(
-        subscribeAllRequests(setLiveAllRequests, onSubError),
+        subscribeAllRequests((items) => {
+          setLiveAllRequests(items);
+          setLoadingRequests(false);
+        }, onSubError),
         subscribeAllStaff(setLiveProfiles, onSubError)
       );
     } else {
       setLiveAllRequests([]);
       setLiveProfiles([]);
+      unsubscribers.push(
+        subscribeStaffProfile(
+          activeStaffId,
+          (updated) => {
+            if (!updated || !updated.isActive) {
+              void logoutSession().catch(() => undefined);
+              clearSignedInState();
+              setAuthErrorBanner('Your staff account is inactive or unavailable.');
+              return;
+            }
+            setLiveProfile(updated);
+          },
+          onSubError
+        ),
+        subscribeMyRequests(
+          activeStaffId,
+          (items) => {
+            setLiveMyRequests(items);
+            setLoadingRequests(false);
+          },
+          onSubError
+        )
+      );
     }
 
-    if (activeRole === 'manager') {
-      unsubscribers.push(subscribeAuditLogs(setLiveAuditLogs, onSubError));
-    } else {
+    if (activeRole !== 'manager') {
       setLiveAuditLogs([]);
     }
 
@@ -288,39 +312,118 @@ export default function App() {
         unsub();
       }
     };
-  }, [activeStaffId, activeRole, addToast, clearSignedInState]);
+  }, [activeStaffId, activeRole, reportSyncError, clearSignedInState]);
 
-  // Real-time listeners for active calendar month capacity
-  useEffect(() => {
-    if (!activeStaffId) return;
-
-    const onMonthError = (err: Error) => {
-      addToast('error', 'Calendar Sync Error', err.message);
-    };
-
-    const unsubCap = subscribeMonthCapacity(
-      calendarYear,
-      calendarMonth0,
-      setLiveCapacityMap,
-      onMonthError
-    );
-    const unsubDetails = subscribeMonthCapacityDetails(
-      calendarYear,
-      calendarMonth0,
-      setLiveCapacityDetailsMap,
-      onMonthError
-    );
-
-    return () => {
-      unsubCap();
-      unsubDetails();
-    };
-  }, [activeStaffId, calendarYear, calendarMonth0, addToast]);
-
-  // One-time automatic backfill so existing Pending & Executive requests reserve daily slots immediately
+  // Keep active Executive/Manager profile synchronized from liveProfiles without duplicate doc listener
   useEffect(() => {
     if (
       !activeStaffId ||
+      (activeRole !== 'executive' && activeRole !== 'manager') ||
+      liveProfiles.length === 0
+    ) {
+      return;
+    }
+    const updated = liveProfiles.find((p) => p.staffId === activeStaffId);
+    if (!updated || !updated.isActive) {
+      void logoutSession().catch(() => undefined);
+      clearSignedInState();
+      setAuthErrorBanner('Your staff account is inactive or unavailable.');
+      return;
+    }
+    setLiveProfile((prev) => {
+      if (
+        prev &&
+        prev.staffId === updated.staffId &&
+        prev.fullName === updated.fullName &&
+        prev.designation === updated.designation &&
+        prev.role === updated.role &&
+        prev.isActive === updated.isActive &&
+        prev.mustChangePassword === updated.mustChangePassword &&
+        prev.unitSection === updated.unitSection &&
+        prev.annualPeriodLimit === updated.annualPeriodLimit &&
+        prev.countsTowardDailyCap === updated.countsTowardDailyCap
+      ) {
+        return prev;
+      }
+      return updated;
+    });
+  }, [activeStaffId, activeRole, liveProfiles, clearSignedInState]);
+
+  // Lazy real-time audit log listener: only active when Manager opens the Audit Logs tab
+  useEffect(() => {
+    if (!activeStaffId || activeRole !== 'manager' || activeView !== 'audit') {
+      return;
+    }
+    const unsub = subscribeAuditLogs(setLiveAuditLogs, (err) => {
+      reportSyncError('Audit Log Sync Error', err);
+    });
+    return () => {
+      unsub();
+    };
+  }, [activeStaffId, activeRole, activeView, reportSyncError]);
+
+  // Real-time listeners for active calendar month capacity (debounced + cached across months)
+  useEffect(() => {
+    if (!activeStaffId) return;
+
+    const monthPrefix = `${calendarYear}-${String(calendarMonth0 + 1).padStart(2, '0')}-`;
+    let unsubCap: (() => void) | null = null;
+    let unsubDetails: (() => void) | null = null;
+    let cancelled = false;
+
+    const onMonthError = (err: Error) => {
+      reportSyncError('Calendar Sync Error', err);
+    };
+
+    const timerId = window.setTimeout(() => {
+      if (cancelled) return;
+      unsubCap = subscribeMonthCapacity(
+        calendarYear,
+        calendarMonth0,
+        (monthMap) => {
+          setLiveCapacityMap((prev) => {
+            const next: Record<string, DailyCapacity> = {};
+            for (const [k, v] of Object.entries(prev)) {
+              if (!k.startsWith(monthPrefix)) {
+                next[k] = v;
+              }
+            }
+            return { ...next, ...monthMap };
+          });
+        },
+        onMonthError
+      );
+      unsubDetails = subscribeMonthCapacityDetails(
+        calendarYear,
+        calendarMonth0,
+        (monthDetails) => {
+          setLiveCapacityDetailsMap((prev) => {
+            const next: Record<string, DailyCapacityDetail> = {};
+            for (const [k, v] of Object.entries(prev)) {
+              if (!k.startsWith(monthPrefix)) {
+                next[k] = v;
+              }
+            }
+            return { ...next, ...monthDetails };
+          });
+        },
+        onMonthError
+      );
+    }, 150);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timerId);
+      unsubCap?.();
+      unsubDetails?.();
+    };
+  }, [activeStaffId, calendarYear, calendarMonth0, reportSyncError]);
+
+  // One-time automatic backfill restricted to Manager sessions only
+  useEffect(() => {
+    if (
+      !activeStaffId ||
+      activeRole !== 'manager' ||
       !settingsLoaded ||
       (!needsCapacitySync && liveSettings.pendingReservesCapacity) ||
       syncedPendingRef.current
@@ -331,7 +434,13 @@ export default function App() {
     void syncPendingCapacity(false).catch(() => {
       syncedPendingRef.current = false;
     });
-  }, [activeStaffId, settingsLoaded, needsCapacitySync, liveSettings.pendingReservesCapacity]);
+  }, [
+    activeStaffId,
+    activeRole,
+    settingsLoaded,
+    needsCapacitySync,
+    liveSettings.pendingReservesCapacity,
+  ]);
 
   const handleLoginSuccess = (user: StaffProfile) => {
     setAuthErrorBanner(null);
@@ -351,6 +460,14 @@ export default function App() {
 
   // For regular staff, allRequests represents their own requests (colleagues' approved
   // spans are merged in StaffDashboard from public non-PII dailyCapacityDetails).
+  const effectiveMyRequests = useMemo(() => {
+    if (!liveProfile) return [];
+    if (liveProfile.role === 'executive' || liveProfile.role === 'manager') {
+      return liveAllRequests.filter((r) => r.staffId === liveProfile.staffId);
+    }
+    return liveMyRequests;
+  }, [liveProfile, liveAllRequests, liveMyRequests]);
+
   const activeAllRequests = useMemo(() => {
     if (!liveProfile) return [];
     if (liveProfile.role === 'executive' || liveProfile.role === 'manager') {
@@ -376,7 +493,7 @@ export default function App() {
 
   const refreshRestrictions = useCallback(async (): Promise<LeaveRestriction[]> => {
     try {
-      const items = await loadActiveRestrictionsStrict();
+      const items = await loadActiveRestrictionsStrict(true);
       setLiveRestrictions(items);
       setRestrictionsStatus('ready');
       setRestrictionsError(null);
@@ -396,7 +513,9 @@ export default function App() {
     setPrefillStart(start);
     setPrefillEnd(end);
     setNewReqModalOpen(true);
-    void refreshRestrictions().catch(() => undefined);
+    if (restrictionsStatus === 'error' || restrictionsFallbackRef.current) {
+      void refreshRestrictions().catch(() => undefined);
+    }
   };
 
   // Keep activeView authorized if role changes in real time
@@ -470,12 +589,21 @@ export default function App() {
     requestedEndDate?: string;
   }) => {
     if (!liveProfile) return;
-    await requestLeaveModification(liveProfile, params.req, {
-      type: params.type,
-      note: params.note,
-      requestedStartDate: params.requestedStartDate,
-      requestedEndDate: params.requestedEndDate,
-    });
+    await requestLeaveModification(
+      liveProfile,
+      params.req,
+      {
+        type: params.type,
+        note: params.note,
+        requestedStartDate: params.requestedStartDate,
+        requestedEndDate: params.requestedEndDate,
+      },
+      {
+        existingUserRequests: effectiveMyRequests,
+        cachedRestrictions: liveRestrictions,
+        settings: liveSettings,
+      }
+    );
     addToast('success', 'Modification Request Sent', 'Management will review your request.');
   };
 
@@ -651,6 +779,8 @@ export default function App() {
 
   const handleClearAllLeaveRecords = async (confirmation: string) => {
     const result = await clearAllLeaveRecords(confirmation);
+    setLiveCapacityMap({});
+    setLiveCapacityDetailsMap({});
     addToast(
       'success',
       'All Leave Records Cleared',
@@ -743,7 +873,7 @@ export default function App() {
       {activeView === 'requests' && (
         <MyRequestsView
           profile={liveProfile}
-          requests={liveMyRequests}
+          requests={effectiveMyRequests}
           allRequests={activeAllRequests}
           restrictions={liveRestrictions}
           capacityMap={liveCapacityMap}
@@ -752,7 +882,6 @@ export default function App() {
           settings={liveSettings}
           loading={loadingRequests}
           onOpenNewRequest={() => handleOpenNewRequest()}
-          onRefreshRestrictions={refreshRestrictions}
           onEditPending={handleEditPending}
           onCancelPending={handleCancelPending}
           onRequestModification={handleRequestModification}
@@ -826,7 +955,7 @@ export default function App() {
         open={newReqModalOpen}
         onClose={() => setNewReqModalOpen(false)}
         staff={liveProfile}
-        userRequests={liveMyRequests}
+        userRequests={effectiveMyRequests}
         allRequests={activeAllRequests}
         capacityMap={liveCapacityMap}
         capacityDetailsMap={liveCapacityDetailsMap}
