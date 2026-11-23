@@ -188,6 +188,45 @@ function checkIpRateLimit(request: Request, env: WorkerEnv): { allowed: boolean;
   return { allowed: true, retryAfterSec: 0 };
 }
 
+function unwrapQuotedOrDoubleEncodedJson(rawInput: string): unknown {
+  let raw = rawInput.replace(/^\uFEFF/, '').trim();
+
+  if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
+    try {
+      const unwrapped = JSON.parse(raw);
+      if (typeof unwrapped === 'string') {
+        raw = unwrapped.trim();
+      } else if (unwrapped && typeof unwrapped === 'object') {
+        return unwrapped;
+      }
+    } catch {
+      raw = raw.slice(1, -1).trim();
+    }
+  } else if (raw.startsWith("'") && raw.endsWith("'") && raw.length >= 2) {
+    raw = raw.slice(1, -1).trim();
+  }
+
+  let parsed: unknown;
+  if (raw.startsWith('{')) {
+    parsed = JSON.parse(raw);
+  } else {
+    try {
+      parsed = JSON.parse(textDecoder.decode(base64UrlDecode(raw.replace(/\s+/g, ''))));
+    } catch {
+      const bin = atob(raw.replace(/\s+/g, ''));
+      parsed = JSON.parse(bin);
+    }
+  }
+
+  if (typeof parsed === 'string') {
+    const inner = parsed.trim();
+    if (inner.startsWith('{')) {
+      parsed = JSON.parse(inner);
+    }
+  }
+  return parsed;
+}
+
 function parseServiceAccount(env: WorkerEnv): ServiceAccountJson {
   const raw = env.FIREBASE_SERVICE_ACCOUNT_KEY?.trim();
   if (!raw) {
@@ -196,29 +235,34 @@ function parseServiceAccount(env: WorkerEnv): ServiceAccountJson {
 
   let parsed: unknown;
   try {
-    if (raw.startsWith('{')) {
-      parsed = JSON.parse(raw);
-    } else {
-      parsed = JSON.parse(textDecoder.decode(base64UrlDecode(raw.replace(/\s+/g, ''))));
-    }
+    parsed = unwrapQuotedOrDoubleEncodedJson(raw);
   } catch {
-    // Standard base64 fallback
-    try {
-      const bin = atob(raw.replace(/\s+/g, ''));
-      parsed = JSON.parse(bin);
-    } catch {
-      throw new Error('Invalid FIREBASE_SERVICE_ACCOUNT_KEY secret format.');
-    }
+    throw new Error('Invalid FIREBASE_SERVICE_ACCOUNT_KEY secret format (expected valid JSON or Base64 JSON).');
   }
 
-  const sa = parsed as Partial<ServiceAccountJson>;
-  if (!sa.client_email || !sa.private_key || !sa.project_id) {
+  const sa = parsed as Partial<ServiceAccountJson> | null;
+  if (
+    !sa ||
+    typeof sa !== 'object' ||
+    typeof sa.client_email !== 'string' ||
+    typeof sa.private_key !== 'string' ||
+    typeof sa.project_id !== 'string' ||
+    !sa.client_email.trim() ||
+    !sa.private_key.trim() ||
+    !sa.project_id.trim()
+  ) {
     throw new Error('FIREBASE_SERVICE_ACCOUNT_KEY is missing project_id, client_email, or private_key.');
   }
+
+  const normalizedPem = sa.private_key
+    .replace(/\\+r\\+n|\\+n|\\+r/g, '\n')
+    .replace(/\r\n?/g, '\n')
+    .trim();
+
   return {
-    project_id: sa.project_id,
-    client_email: sa.client_email,
-    private_key: sa.private_key.replace(/\\n/g, '\n'),
+    project_id: sa.project_id.trim(),
+    client_email: sa.client_email.trim(),
+    private_key: normalizedPem,
   };
 }
 
@@ -226,24 +270,45 @@ async function importServicePrivateKey(pem: string): Promise<CryptoKey> {
   if (cachedPrivateKey && cachedPrivateKey.pem === pem) {
     return cachedPrivateKey.key;
   }
+  if (pem.includes('BEGIN RSA PRIVATE KEY')) {
+    throw new Error(
+      'Service account private_key is PKCS#1 format; PKCS#8 ("BEGIN PRIVATE KEY") is required.'
+    );
+  }
   const pemBody = pem
     .replace(/-----BEGIN PRIVATE KEY-----/g, '')
     .replace(/-----END PRIVATE KEY-----/g, '')
     .replace(/\s+/g, '');
-  const binary = atob(pemBody);
-  const der = new Uint8Array(binary.length);
+  if (!pemBody) {
+    throw new Error('Service account private_key body is empty after stripping PEM headers.');
+  }
+
+  let binary: string;
+  try {
+    binary = atob(pemBody);
+  } catch {
+    throw new Error('Service account private_key PEM contains invalid Base64 characters.');
+  }
+
+  const der = new Uint8Array(new ArrayBuffer(binary.length));
   for (let i = 0; i < binary.length; i += 1) {
     der[i] = binary.charCodeAt(i);
   }
-  const key = await crypto.subtle.importKey(
-    'pkcs8',
-    der.buffer,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  cachedPrivateKey = { pem, key };
-  return key;
+
+  try {
+    const key = await crypto.subtle.importKey(
+      'pkcs8',
+      der.buffer,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    cachedPrivateKey = { pem, key };
+    return key;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`Service account private_key PKCS#8 import failed: ${detail}`);
+  }
 }
 
 async function signRs256Jwt(
@@ -309,15 +374,32 @@ async function getGoogleAccessToken(sa: ServiceAccountJson): Promise<string> {
     body: new URLSearchParams({
       grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
       assertion,
-    }),
+    }).toString(),
   });
 
   if (!res.ok) {
+    cachedAccessToken = null;
     const errText = await res.text();
-    throw new Error(`Google OAuth token exchange failed (${res.status}): ${errText}`);
+    let oauthReason = errText.slice(0, 200);
+    try {
+      const parsedErr = JSON.parse(errText) as { error?: string; error_description?: string };
+      if (parsedErr.error) {
+        oauthReason = parsedErr.error_description
+          ? `${parsedErr.error}: ${parsedErr.error_description}`
+          : parsedErr.error;
+      }
+    } catch {
+      // keep truncated plain text
+    }
+    throw new Error(`Google OAuth token exchange failed (${res.status}): ${oauthReason}`);
   }
 
-  const body = (await res.json()) as { access_token: string; expires_in?: number };
+  const body = (await res.json()) as { access_token?: string; expires_in?: number };
+  if (!body.access_token || typeof body.access_token !== 'string') {
+    cachedAccessToken = null;
+    throw new Error('Google OAuth token response did not include access_token.');
+  }
+
   cachedAccessToken = {
     token: body.access_token,
     expiresAtMs: now + ((body.expires_in || 3600) * 1000),
@@ -573,12 +655,13 @@ async function findAuthorizedStaffDoc(
   projectId: string,
   accessToken: string,
   rawStaffId: string
-): Promise<{ staffId: string; doc: FirestoreDocument } | null> {
+): Promise<{ staffId: string; docId: string; doc: FirestoreDocument } | null> {
   const trimmed = rawStaffId.trim();
   const exact = await fsGetDoc(projectId, accessToken, `staff/${trimmed}`);
   if (exact) {
-    const id = fsStr(exact.fields, 'staffId') || fsDocId(exact.name) || trimmed;
-    return { staffId: id, doc: exact };
+    const docId = fsDocId(exact.name) || trimmed;
+    const id = fsStr(exact.fields, 'staffId') || docId;
+    return { staffId: id, docId, doc: exact };
   }
 
   const targetToken = normalizeStaffIdToken(trimmed);
@@ -586,9 +669,14 @@ async function findAuthorizedStaffDoc(
 
   const allStaff = await fsListCollection(projectId, accessToken, 'staff');
   for (const doc of allStaff) {
-    const candidateId = fsStr(doc.fields, 'staffId') || fsDocId(doc.name);
-    if (candidateId && normalizeStaffIdToken(candidateId) === targetToken) {
-      return { staffId: candidateId, doc };
+    const docId = fsDocId(doc.name);
+    const fieldStaffId = fsStr(doc.fields, 'staffId');
+    const candidateId = fieldStaffId || docId;
+    if (
+      (fieldStaffId && normalizeStaffIdToken(fieldStaffId) === targetToken) ||
+      (docId && normalizeStaffIdToken(docId) === targetToken)
+    ) {
+      return { staffId: candidateId, docId: docId || candidateId, doc };
     }
   }
   return null;
@@ -1412,6 +1500,120 @@ async function authenticateActiveCaller(
 /* Route Handlers                                                             */
 /* -------------------------------------------------------------------------- */
 
+type LoginStage =
+  | 'parse_service_account'
+  | 'get_access_token'
+  | 'lookup_staff_record'
+  | 'lookup_pin_secret'
+  | 'verify_pin_hash'
+  | 'update_failed_attempts'
+  | 'sync_auth_link'
+  | 'sync_staff_profile'
+  | 'create_custom_token';
+
+class LoginStageError extends Error {
+  stage: LoginStage;
+  status: number;
+  publicMessage: string;
+
+  constructor(stage: LoginStage, publicMessage: string, causeMessage?: string, status = 500) {
+    super(causeMessage || publicMessage);
+    this.stage = stage;
+    this.status = status;
+    this.publicMessage = publicMessage;
+  }
+}
+
+function summarizeSafeLoginError(
+  stage: LoginStage,
+  err: unknown,
+  projectId: string,
+  saProjectId?: string
+): string {
+  const rawMsg = err instanceof Error ? err.message : String(err);
+
+  if (stage === 'parse_service_account') {
+    if (rawMsg.includes('FIREBASE_SERVICE_ACCOUNT_KEY')) {
+      return rawMsg;
+    }
+    return 'Invalid FIREBASE_SERVICE_ACCOUNT_KEY server configuration.';
+  }
+
+  if (stage === 'get_access_token') {
+    if (rawMsg.includes('private_key') || rawMsg.includes('PKCS')) {
+      return `${rawMsg} Verify FIREBASE_SERVICE_ACCOUNT_KEY private_key formatting.`;
+    }
+    if (rawMsg.includes('Google OAuth token exchange failed')) {
+      return `Firebase service-account OAuth error (${rawMsg.replace(/^Google OAuth token exchange failed\s*/, '')}). Verify FIREBASE_SERVICE_ACCOUNT_KEY and service account status.`;
+    }
+    return 'Unable to authenticate service account with Google OAuth. Verify FIREBASE_SERVICE_ACCOUNT_KEY.';
+  }
+
+  if (
+    stage === 'lookup_staff_record' ||
+    stage === 'lookup_pin_secret' ||
+    stage === 'update_failed_attempts' ||
+    stage === 'sync_auth_link' ||
+    stage === 'sync_staff_profile'
+  ) {
+    const mismatchNote =
+      saProjectId && saProjectId !== projectId
+        ? ` (Service account project "${saProjectId}" differs from configured project "${projectId}".)`
+        : '';
+    if (rawMsg.includes('(403)')) {
+      return `Firestore access denied during ${stage} on project "${projectId}".${mismatchNote} Verify service account IAM permissions.`;
+    }
+    if (rawMsg.includes('(404)')) {
+      return `Firestore database "(default)" or collection unreachable during ${stage} on project "${projectId}".${mismatchNote}`;
+    }
+    return `Firestore service error during ${stage} on project "${projectId}".${mismatchNote}`;
+  }
+
+  if (stage === 'verify_pin_hash') {
+    return 'Stored PIN credential format is invalid for this account. Contact a Manager to reset your PIN.';
+  }
+
+  if (stage === 'create_custom_token') {
+    return 'Failed to sign Firebase authentication token. Verify FIREBASE_SERVICE_ACCOUNT_KEY private_key.';
+  }
+
+  return 'Authentication service error. Please verify server configuration and try again.';
+}
+
+async function runLoginStage<T>(
+  stage: LoginStage,
+  context: { projectId: string; saProjectId?: string; staffId?: string },
+  fn: () => Promise<T>
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof HttpApiError || err instanceof LoginStageError) {
+      throw err;
+    }
+    const errName = err instanceof Error ? err.name : typeof err;
+    const errMessage = err instanceof Error ? err.message : String(err);
+    console.error('[auth/login] Stage error:', {
+      stage,
+      projectId: context.projectId,
+      saProjectId: context.saProjectId || null,
+      projectIdMismatch: Boolean(
+        context.saProjectId && context.saProjectId !== context.projectId
+      ),
+      staffId: context.staffId || null,
+      errorName: errName,
+      errorMessage: errMessage.slice(0, 400),
+    });
+    const publicMessage = summarizeSafeLoginError(
+      stage,
+      err,
+      context.projectId,
+      context.saProjectId
+    );
+    throw new LoginStageError(stage, publicMessage, errMessage, 500);
+  }
+}
+
 async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> {
   const ipLimit = checkIpRateLimit(request, env);
   if (!ipLimit.allowed) {
@@ -1436,17 +1638,37 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
     return jsonResponse({ error: 'Invalid Staff ID or PIN.' }, 401);
   }
 
-  const sa = parseServiceAccount(env);
+  const envProjectId = env.FIREBASE_PROJECT_ID?.trim() || 'ss-leave-management';
+  const sa = await runLoginStage(
+    'parse_service_account',
+    { projectId: envProjectId },
+    async () => parseServiceAccount(env)
+  );
   const projectId = env.FIREBASE_PROJECT_ID?.trim() || sa.project_id;
-  const accessToken = await getGoogleAccessToken(sa);
+  if (sa.project_id !== projectId) {
+    console.warn('[auth/login] Service account project_id differs from configured projectId:', {
+      configuredProjectId: projectId,
+      serviceAccountProjectId: sa.project_id,
+    });
+  }
+
+  const accessToken = await runLoginStage(
+    'get_access_token',
+    { projectId, saProjectId: sa.project_id },
+    () => getGoogleAccessToken(sa)
+  );
 
   // 1. Verify Staff ID already exists as an authorized staff record (never auto-register unknown IDs)
-  const found = await findAuthorizedStaffDoc(projectId, accessToken, rawStaffId);
+  const found = await runLoginStage(
+    'lookup_staff_record',
+    { projectId, saProjectId: sa.project_id, staffId: rawStaffId },
+    () => findAuthorizedStaffDoc(projectId, accessToken, rawStaffId)
+  );
   if (!found) {
     return jsonResponse({ error: 'Invalid Staff ID or PIN.' }, 401);
   }
 
-  const { staffId, doc: staffDoc } = found;
+  const { staffId, docId: staffDocId, doc: staffDoc } = found;
   const staffFields = staffDoc.fields || {};
   if (!fsBool(staffFields, 'isActive', true)) {
     return jsonResponse(
@@ -1455,10 +1677,26 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
     );
   }
 
-  // 2. Read server-only hashed PIN credential from staffPinSecrets/{staffId}
-  const secretDoc = await fsGetDoc(projectId, accessToken, `staffPinSecrets/${staffId}`);
+  // 2. Read server-only hashed PIN credential from staffPinSecrets/{staffId} (with docId fallback)
+  let secretDocId = staffId;
+  const secretDoc = await runLoginStage(
+    'lookup_pin_secret',
+    { projectId, saProjectId: sa.project_id, staffId },
+    async () => {
+      const primary = await fsGetDoc(projectId, accessToken, `staffPinSecrets/${staffId}`);
+      if (primary) return primary;
+      if (staffDocId && staffDocId !== staffId) {
+        const fallback = await fsGetDoc(projectId, accessToken, `staffPinSecrets/${staffDocId}`);
+        if (fallback) {
+          secretDocId = staffDocId;
+          return fallback;
+        }
+      }
+      return null;
+    }
+  );
   if (!secretDoc || !secretDoc.fields) {
-    console.warn(`[auth] Missing staffPinSecrets/${staffId}; administrator must run initial PIN provisioning.`);
+    console.warn(`[auth/login] Missing staffPinSecrets/${staffId}; administrator must run initial PIN provisioning.`);
     return jsonResponse({ error: 'Invalid Staff ID or PIN.' }, 401);
   }
 
@@ -1476,23 +1714,32 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
     );
   }
 
-  const pinSalt = fsStr(secretFields, 'pinSalt');
-  const pinHash = fsStr(secretFields, 'pinHash');
+  const pinSalt = fsStr(secretFields, 'pinSalt').trim();
+  const pinHash = fsStr(secretFields, 'pinHash').trim().toLowerCase();
   if (!pinSalt || !pinHash) {
     return jsonResponse({ error: 'Invalid Staff ID or PIN.' }, 401);
   }
 
-  const computedHash = await hashPinPbkdf2(rawPin, pinSalt);
+  const computedHash = await runLoginStage(
+    'verify_pin_hash',
+    { projectId, saProjectId: sa.project_id, staffId },
+    () => hashPinPbkdf2(rawPin, pinSalt)
+  );
   if (!constantTimeEqualHex(computedHash, pinHash)) {
     const nextFailed = fsInt(secretFields, 'failedAttempts', 0) + 1;
     const nextLockedUntil =
       nextFailed >= MAX_FAILED_PIN_ATTEMPTS ? nowMs + LOCKOUT_DURATION_MS : 0;
 
-    await fsPatchDoc(projectId, accessToken, `staffPinSecrets/${staffId}`, {
-      failedAttempts: { integerValue: String(nextFailed) },
-      lockedUntilMs: { integerValue: String(nextLockedUntil) },
-      updatedAt: { timestampValue: new Date(nowMs).toISOString() },
-    });
+    await runLoginStage(
+      'update_failed_attempts',
+      { projectId, saProjectId: sa.project_id, staffId },
+      () =>
+        fsPatchDoc(projectId, accessToken, `staffPinSecrets/${secretDocId}`, {
+          failedAttempts: { integerValue: String(nextFailed) },
+          lockedUntilMs: { integerValue: String(nextLockedUntil) },
+          updatedAt: { timestampValue: new Date(nowMs).toISOString() },
+        })
+    );
 
     if (nextLockedUntil > 0) {
       return jsonResponse(
@@ -1515,46 +1762,69 @@ async function handleLogin(request: Request, env: WorkerEnv): Promise<Response> 
   const nowIso = new Date(nowMs).toISOString();
 
   if (fsInt(secretFields, 'failedAttempts', 0) !== 0 || lockedUntilMs !== 0) {
-    await fsPatchDoc(projectId, accessToken, `staffPinSecrets/${staffId}`, {
-      failedAttempts: { integerValue: '0' },
-      lockedUntilMs: { integerValue: '0' },
-      updatedAt: { timestampValue: nowIso },
-    });
+    await runLoginStage(
+      'update_failed_attempts',
+      { projectId, saProjectId: sa.project_id, staffId },
+      () =>
+        fsPatchDoc(projectId, accessToken, `staffPinSecrets/${secretDocId}`, {
+          failedAttempts: { integerValue: '0' },
+          lockedUntilMs: { integerValue: '0' },
+          updatedAt: { timestampValue: nowIso },
+        })
+    );
   }
 
   // 4. Sync non-destructive auth link fields (preserve all existing staff profile data)
+  const candidateUid =
+    fsStr(staffFields, 'authUid').trim() ||
+    fsStr(secretFields, 'authUid').trim();
   const uid =
-    fsStr(staffFields, 'authUid') ||
-    fsStr(secretFields, 'authUid') ||
-    deterministicStaffUid(staffId);
+    candidateUid && /^[a-zA-Z0-9_-]{1,128}$/.test(candidateUid)
+      ? candidateUid
+      : deterministicStaffUid(staffId);
   const role = fsStr(staffFields, 'role') || 'staff';
   const designation = fsStr(staffFields, 'designation') || 'ASSISTANT OFFICER';
 
-  await fsPatchDoc(projectId, accessToken, `staffAuthLinks/${uid}`, {
-    uid: { stringValue: uid },
-    staffId: { stringValue: staffId },
-    role: { stringValue: role },
-    designation: { stringValue: designation },
-    isActive: { booleanValue: true },
-    updatedAt: { timestampValue: nowIso },
-  });
+  await runLoginStage(
+    'sync_auth_link',
+    { projectId, saProjectId: sa.project_id, staffId },
+    () =>
+      fsPatchDoc(projectId, accessToken, `staffAuthLinks/${uid}`, {
+        uid: { stringValue: uid },
+        staffId: { stringValue: staffId },
+        role: { stringValue: role },
+        designation: { stringValue: designation },
+        isActive: { booleanValue: true },
+        updatedAt: { timestampValue: nowIso },
+      })
+  );
 
   if (
     fsStr(staffFields, 'authUid') !== uid ||
     fsBool(staffFields, 'mustChangePassword', false) !== mustChangePin
   ) {
-    await fsPatchDoc(projectId, accessToken, `staff/${staffId}`, {
-      authUid: { stringValue: uid },
-      mustChangePassword: { booleanValue: mustChangePin },
-      updatedAt: { timestampValue: nowIso },
-    });
+    await runLoginStage(
+      'sync_staff_profile',
+      { projectId, saProjectId: sa.project_id, staffId },
+      () =>
+        fsPatchDoc(projectId, accessToken, `staff/${staffDocId || staffId}`, {
+          authUid: { stringValue: uid },
+          mustChangePassword: { booleanValue: mustChangePin },
+          updatedAt: { timestampValue: nowIso },
+        })
+    );
   }
 
   // 5. Mint Firebase Authentication custom token
-  const customToken = await createFirebaseCustomToken(sa, uid, {
-    staffId,
-    role,
-  });
+  const customToken = await runLoginStage(
+    'create_custom_token',
+    { projectId, saProjectId: sa.project_id, staffId },
+    () =>
+      createFirebaseCustomToken(sa, uid, {
+        staffId,
+        role,
+      })
+  );
 
   return jsonResponse({
     customToken,
@@ -4383,6 +4653,43 @@ async function handleClearAllLeaveRecords(
   });
 }
 
+async function buildSafeHealthReport(env: WorkerEnv) {
+  const configuredProjectId = env.FIREBASE_PROJECT_ID?.trim() || 'ss-leave-management';
+  const configured = Boolean(env.FIREBASE_SERVICE_ACCOUNT_KEY?.trim());
+  let serviceAccountValid = false;
+  let privateKeyValid = false;
+  let serviceAccountProjectId: string | null = null;
+  let projectIdMatch = false;
+  let configError: string | null = null;
+
+  if (configured) {
+    try {
+      const sa = parseServiceAccount(env);
+      serviceAccountValid = true;
+      serviceAccountProjectId = sa.project_id;
+      projectIdMatch = sa.project_id === configuredProjectId;
+      await importServicePrivateKey(sa.private_key);
+      privateKeyValid = true;
+    } catch (err) {
+      configError = err instanceof Error ? err.message : String(err);
+    }
+  } else {
+    configError = 'FIREBASE_SERVICE_ACCOUNT_KEY secret is not set.';
+  }
+
+  return {
+    ok: true,
+    projectId: configuredProjectId,
+    configured,
+    serviceAccountValid,
+    privateKeyValid,
+    serviceAccountProjectId,
+    projectIdMatch,
+    ...(configError ? { configError } : {}),
+    availableBindings: Object.keys(env),
+  };
+}
+
 export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     const url = new URL(request.url);
@@ -4390,12 +4697,7 @@ export default {
     if (url.pathname.startsWith('/api/')) {
       try {
         if (request.method === 'GET' && url.pathname === '/api/health') {
-          return jsonResponse({
-            ok: true,
-            projectId: env.FIREBASE_PROJECT_ID || 'ss-leave-management',
-            configured: Boolean(env.FIREBASE_SERVICE_ACCOUNT_KEY?.trim()),
-            availableBindings: Object.keys(env),
-          });
+          return jsonResponse(await buildSafeHealthReport(env));
         }
         if (request.method === 'POST' && url.pathname === '/api/auth/login') {
           return await handleLogin(request, env);
@@ -4456,7 +4758,17 @@ export default {
         if (err instanceof HttpApiError) {
           return jsonResponse({ error: err.message }, err.status);
         }
-        console.error('[worker] Unhandled API error:', err);
+        if (err instanceof LoginStageError) {
+          return jsonResponse({ error: err.publicMessage, stage: err.stage }, err.status);
+        }
+        const errName = err instanceof Error ? err.name : typeof err;
+        const errMessage = err instanceof Error ? err.message : String(err);
+        console.error('[worker] Unhandled API error:', {
+          method: request.method,
+          path: url.pathname,
+          errorName: errName,
+          errorMessage: errMessage.slice(0, 400),
+        });
         const message =
           err instanceof Error && err.message.includes('FIREBASE_SERVICE_ACCOUNT_KEY')
             ? err.message
